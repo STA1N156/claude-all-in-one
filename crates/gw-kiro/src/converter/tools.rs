@@ -1,8 +1,7 @@
-//! 工具转换:JSON Schema 归一化、超长名 sanitize+映射、占位符、分块策略后缀。
+//! 工具转换:JSON Schema 归一化、超长名 sanitize+映射、占位符。
 
 use std::collections::HashMap;
 use sha2::{Digest, Sha256};
-use super::MessagesRequest;
 use crate::kiro_types::conversation::Message;
 use crate::kiro_types::tool::{InputSchema, Tool, ToolSpecification};
 
@@ -260,17 +259,6 @@ pub(super) fn convert_tools(
         .iter()
         .map(|t| {
             let mut description = t.description.clone();
-
-            // 对 Write/Edit 工具追加自定义描述后缀
-            let suffix = match t.name.as_str() {
-                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-                _ => "",
-            };
-            if !suffix.is_empty() {
-                description.push('\n');
-                description.push_str(suffix);
-            }
 
             // 空描述兜底:某些 Kiro 模型版本拒绝空 description 工具规格(400)。
             // 对齐 static_flow:填 "Client-provided tool '{name}'"。
@@ -547,24 +535,9 @@ pub(super) fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
     tool_names
 }
 
-/// 请求里是否带了受分块策略约束的工具（Write / Edit）。
-/// 仅当存在这两个工具时，才把 SYSTEM_CHUNKED_POLICY 注入系统消息，
-/// 避免对不含这两个工具的干净客户端造成行为污染。
-pub(super) fn request_has_chunked_tools(req: &MessagesRequest) -> bool {
-    req.tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|t| t.name == "Write" || t.name == "Edit"))
-}
-
 /// Kiro API 工具名称最大长度限制
 pub(super) const TOOL_NAME_MAX_LEN: usize = 63;
 
 /// 工具描述最大长度（字符）。超长描述安全截断，避免上游因超大 schema 报错。
 /// 命名常量而非散落魔法数；converter 为无状态自由函数，不引入 config 穿透。
 pub(super) const TOOL_DESCRIPTION_MAX_LEN: usize = 10000;
-
-/// 追加到 Write 工具 description 末尾的内容
-pub(super) const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
-
-/// 追加到 Edit 工具 description 末尾的内容
-pub(super) const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";

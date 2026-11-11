@@ -622,6 +622,10 @@ async fn create_account(
     }
     // provider 在 extra_json 序列化前确定,以便 dario 路径能并入凭据。
     let provider = body.provider.as_deref().filter(|p| !p.is_empty()).unwrap_or("kiro");
+    // 创建时即写入新协议,首次被 worker 读取时已生效。
+    if provider == "kiro" {
+        extra_map.insert(gw_kiro::ENDPOINT_KEY.into(), serde_json::json!("responses"));
+    }
     // claude-dario:若带了 .credentials.json 全文,解析后并入 extra(不覆盖操作者已填的同名字段),
     // 并补生成稳定身份 device_id / account_uuid(凭证文件里没有)。
     if provider == "claude-dario" {
@@ -1524,6 +1528,7 @@ async fn import_accounts(
             // 返回 false = 并发下别人刚插了同 id(竞态)→ 当 skipped,不谎报 created。
             // 批量代理:操作员显式意图,写进新账号 extra.proxy(已校验归一)。
             let mut new_extra = imp.extra.clone();
+            new_extra.insert(gw_kiro::ENDPOINT_KEY.into(), serde_json::json!("responses"));
             // 孪生号:记下源号 ID,供 worker 侧 RT 失效时借链自愈(twin_resync)。
             if let Some(src) = &twin_of {
                 new_extra.insert("twin_of".into(), serde_json::json!(src));

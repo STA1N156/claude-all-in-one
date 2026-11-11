@@ -35,6 +35,7 @@ import {
   buildProviderTabs,
   deriveAccountStatus,
   deriveTier,
+  formatCredits,
   mergeRuntimeByAccount,
   quotaKindForProvider,
   sortAccounts,
@@ -103,6 +104,27 @@ export default function AccountsPage() {
     () => (accountsQuery.data ?? []).some((row) => row.provider === 'kiro'),
     [accountsQuery.data],
   )
+
+  const totalQuota = useMemo(() => {
+    let limit = 0, remaining = 0, count = 0, pending = 0
+    for (const row of accountsQuery.data ?? []) {
+      const runtime = runtimeByAccount.get(row.account_id)
+      if (row.provider !== 'kiro' || row.disabled || !runtime?.online || runtime.status.disabled) continue
+      const quota = runtime.status.quota
+      if (!quota || !Number.isFinite(quota.limit) || !Number.isFinite(quota.remaining)) {
+        pending++
+        continue
+      }
+      if (quota.limit <= 0 || quota.remaining <= 0) continue
+      limit += quota.limit
+      remaining += Math.min(quota.limit, quota.remaining)
+      count++
+    }
+    const used = limit - remaining
+    return { limit, remaining, used, count, pending, percent: limit > 0 ? used / limit * 100 : 0 }
+  }, [accountsQuery.data, runtimeByAccount])
+  const quotaReady = accountsQuery.isSuccess && runtimeQuery.isSuccess
+    && (totalQuota.count > 0 || totalQuota.pending === 0)
 
   // 在 kiro/all 且有 kiro 账号时展示档位筛选
   const showTierFilter =
@@ -302,6 +324,35 @@ export default function AccountsPage() {
           </Button>
         </div>
       </header>
+
+      {hasKiroAccounts && (providerFilter === 'all' || providerFilter === 'kiro') && (
+        <section className="rounded-2xl border bg-card px-5 py-4">
+          <div className="mb-3 flex flex-wrap items-end justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-medium">{t('accounts.totalQuota.title')}</h2>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {quotaReady ? t('accounts.totalQuota.used', {
+                  used: formatCredits(totalQuota.used), total: formatCredits(totalQuota.limit),
+                  count: totalQuota.count,
+                }) : '—'}
+              </p>
+            </div>
+            <p className="text-xl font-semibold tabular-nums tracking-tight">
+              {quotaReady ? t('accounts.totalQuota.remaining', { n: formatCredits(totalQuota.remaining) }) : '—'}
+            </p>
+          </div>
+          <div role="progressbar" aria-label={t('accounts.totalQuota.title')}
+            aria-valuemin={0} aria-valuemax={100} aria-valuenow={quotaReady ? totalQuota.percent : undefined}
+            className="h-2 overflow-hidden rounded-full bg-muted">
+            <div className={cn('h-full rounded-full transition-[width] duration-500',
+              totalQuota.percent >= 90 ? 'bg-warning' : 'bg-primary')}
+              style={{ width: `${quotaReady ? totalQuota.percent : 0}%` }} />
+          </div>
+          {totalQuota.pending > 0 && (
+            <p className="mt-2 text-xs text-muted-foreground">{t('accounts.totalQuota.pending', { n: totalQuota.pending })}</p>
+          )}
+        </section>
+      )}
 
       {accountsQuery.isError && <ErrorNote error={accountsQuery.error} />}
       {/* 启停/删除/刷新失败时的提示（下一次操作发起时自动清除） */}

@@ -647,47 +647,16 @@ fn req_with_system_and_tools(
 }
 
 #[test]
-fn test_chunked_policy_injected_when_write_tool_present() {
-    let req = req_with_system_and_tools(Some(vec![make_named_tool("Write")]));
-    let result = convert_request(&req, "").unwrap();
-    assert!(
-        first_history_user_text(&result).contains("comply silently"),
-        "带 Write 工具时应注入 SYSTEM_CHUNKED_POLICY"
-    );
-}
-
-#[test]
-fn test_chunked_policy_injected_when_edit_tool_present() {
-    let req = req_with_system_and_tools(Some(vec![make_named_tool("Edit")]));
-    let result = convert_request(&req, "").unwrap();
-    assert!(
-        first_history_user_text(&result).contains("comply silently"),
-        "带 Edit 工具时应注入 SYSTEM_CHUNKED_POLICY"
-    );
-}
-
-#[test]
-fn test_chunked_policy_absent_for_clean_client() {
-    // 无工具的干净客户端（如第三方行为检测）：系统消息不应被污染
-    let req = req_with_system_and_tools(None);
-    let result = convert_request(&req, "").unwrap();
-    let text = first_history_user_text(&result);
-    assert!(
-        !text.contains("comply silently"),
-        "无 Write/Edit 工具时不应注入分块策略，避免行为污染"
-    );
-    assert!(text.contains("helpful assistant"), "原始系统提示应原样保留");
-}
-
-#[test]
-fn test_chunked_policy_absent_when_only_other_tools() {
-    // 带了别的工具（非 Write/Edit）也不应注入
-    let req = req_with_system_and_tools(Some(vec![make_named_tool("get_weather")]));
-    let result = convert_request(&req, "").unwrap();
-    assert!(
-        !first_history_user_text(&result).contains("comply silently"),
-        "仅含非 Write/Edit 工具时不应注入分块策略"
-    );
+fn test_client_system_and_tool_descriptions_preserved() {
+    for name in ["Write", "Edit", "get_weather"] {
+        let req = req_with_system_and_tools(Some(vec![make_named_tool(name)]));
+        for wire in [ConvertWire::Kiro, ConvertWire::Responses] {
+            let result = convert_request_for(&req, "", wire).unwrap();
+            assert_eq!(first_history_user_text(&result), "You are a helpful assistant.");
+            let tools = &result.conversation_state.current_message.user_input_message.user_input_message_context.tools;
+            assert_eq!(tools[0].tool_specification.description, "desc");
+        }
+    }
 }
 
 #[test]
@@ -893,9 +862,7 @@ fn test_structured_output_instruction_absent_without_schema() {
 }
 
 #[test]
-fn test_identity_override_and_privacy_always_injected() {
-    // 防封:即使客户端无 system,history[0] 也必须带 identity_override + 两条隐私策略
-    // (逐字对齐 static_flow,阻止上游自曝 Kiro)。
+fn test_no_system_adds_no_prompt_history() {
     let req = MessagesRequest {
         model: "claude-opus-4-8".to_string(),
         max_tokens: 256,
@@ -912,12 +879,11 @@ fn test_identity_override_and_privacy_always_injected() {
         metadata: None,
         context_management: None,
     };
-    let result = convert_request(&req, "").unwrap();
-    let h0 = first_history_user_text(&result);
-    assert!(h0.contains("<identity_override>"), "应注入 identity_override: {h0}");
-    assert!(h0.contains("Never claim to be Kiro"), "identity_override 文案应逐字: {h0}");
-    assert!(h0.contains("Visible thinking may be shown"), "应注入可见思考隐私策略");
-    assert!(h0.contains("When answering identity, platform, routing"), "应注入系统提示隐私策略");
+    for wire in [ConvertWire::Kiro, ConvertWire::Responses] {
+        let result = convert_request_for(&req, "", wire).unwrap();
+        assert!(result.conversation_state.history.is_empty());
+        assert_eq!(result.conversation_state.current_message.user_input_message.content, "你是谁");
+    }
 }
 
 #[test]
@@ -1780,7 +1746,7 @@ fn hist_asst(thinking: &str, text: &str) -> crate::anthropic_types::Message {
     signed_asst(thinking, REAL_SIG_QUINCE, text)
 }
 
-/// 历史里所有 assistant 消息的 content(含系统对的固定应答,在 index 0)。
+/// 历史里所有 assistant 消息的 content。
 fn history_assistant_contents(history: &[Message]) -> Vec<String> {
     history
         .iter()
@@ -1829,13 +1795,13 @@ fn test_build_history_thinking_window_slides_tail_only() {
     let h3 = build_history_with_turns(&req, &turn3, "claude-opus-4.8", &[], &mut map, 1, ConvertWire::Kiro).unwrap();
     let h4 = build_history_with_turns(&req, &turn4, "claude-opus-4.8", &[], &mut map, 1, ConvertWire::Kiro).unwrap();
 
-    // turns=1:只有倒数第 1 个 assistant 单元挂 reasoning(flags[0] 是系统对的固定应答)。
-    assert_eq!(history_assistant_reasoning(&h2), [false, true], "末段应挂 reasoning");
-    assert_eq!(history_assistant_reasoning(&h3), [false, false, true], "滑出窗口即摘");
-    assert_eq!(history_assistant_reasoning(&h4), [false, false, false, true]);
+    // turns=1:只有倒数第 1 个 assistant 单元挂 reasoning。
+    assert_eq!(history_assistant_reasoning(&h2), [true], "末段应挂 reasoning");
+    assert_eq!(history_assistant_reasoning(&h3), [false, true], "滑出窗口即摘");
+    assert_eq!(history_assistant_reasoning(&h4), [false, false, true]);
     // 正文永远是纯文本,不含 thinking 嵌入。
     let a4 = history_assistant_contents(&h4);
-    assert_eq!(a4[1..], ["答1", "答2", "答3"], "正文不得含 thinking 字节");
+    assert_eq!(a4, ["答1", "答2", "答3"], "正文不得含 thinking 字节");
 
     // 核心断言:h3 → h4 的变化**只发生在 h3 的尾部**(答2 从挂变摘),
     // 其前所有历史条目跨轮逐字节一致。
@@ -1869,12 +1835,12 @@ fn test_build_history_thinking_window_counts_merged_units() {
 
     // turns=1:单元1 整体丢,单元2 保留。
     let h = build_history_with_turns(&req, &msgs, "claude-opus-4.8", &[], &mut map, 1, ConvertWire::Kiro).unwrap();
-    assert_eq!(history_assistant_contents(&h)[1], "答1a\n\n答1b", "合并正文按 \\n\\n 拼接");
-    assert_eq!(history_assistant_reasoning(&h), [false, false, true]);
+    assert_eq!(history_assistant_contents(&h)[0], "答1a\n\n答1b", "合并正文按 \\n\\n 拼接");
+    assert_eq!(history_assistant_reasoning(&h), [false, true]);
 
     // turns=2:两个单元都在窗口内;合并单元挂的是最后一条消息(思1b)的 reasoning。
     let h = build_history_with_turns(&req, &msgs, "claude-opus-4.8", &[], &mut map, 2, ConvertWire::Kiro).unwrap();
-    assert_eq!(history_assistant_reasoning(&h), [false, true, true]);
+    assert_eq!(history_assistant_reasoning(&h), [true, true]);
     let unit1 = h.iter().find_map(|m| match m {
         Message::Assistant(a)
             if a.assistant_response_message.content == "答1a\n\n答1b" =>
@@ -1909,20 +1875,20 @@ fn test_build_history_turns_zero_two_and_negative() {
     // turns=0(默认):全部不挂 reasoning,正文纯文本。
     let h = build_history_with_turns(&req, &msgs, "claude-opus-4.8", &[], &mut map, 0, ConvertWire::Kiro).unwrap();
     let a = history_assistant_contents(&h);
-    assert_eq!(a[1..], ["答1", "答2", "答3无思考"], "turns=0 正文必须全纯文本");
-    assert_eq!(history_assistant_reasoning(&h), [false, false, false, false]);
+    assert_eq!(a, ["答1", "答2", "答3无思考"], "turns=0 正文必须全纯文本");
+    assert_eq!(history_assistant_reasoning(&h), [false, false, false]);
 
     // turns=2:窗口外(单元1)不挂,窗口内(单元2)挂;无 thinking 的轮次(单元3)不凭空造。
     let h = build_history_with_turns(&req, &msgs, "claude-opus-4.8", &[], &mut map, 2, ConvertWire::Kiro).unwrap();
-    assert_eq!(history_assistant_reasoning(&h), [false, false, true, false]);
+    assert_eq!(history_assistant_reasoning(&h), [false, true, false]);
     let a = history_assistant_contents(&h);
-    assert_eq!(a[1..], ["答1", "答2", "答3无思考"]);
+    assert_eq!(a, ["答1", "答2", "答3无思考"]);
 
     // turns=-1:全量保留;无 thinking 的轮次仍然只是正文。
     let h = build_history_with_turns(&req, &msgs, "claude-opus-4.8", &[], &mut map, -1, ConvertWire::Kiro).unwrap();
-    assert_eq!(history_assistant_reasoning(&h), [false, true, true, false]);
+    assert_eq!(history_assistant_reasoning(&h), [true, true, false]);
     let a = history_assistant_contents(&h);
-    assert_eq!(a[1..], ["答1", "答2", "答3无思考"]);
+    assert_eq!(a, ["答1", "答2", "答3无思考"]);
 }
 
 #[test]
