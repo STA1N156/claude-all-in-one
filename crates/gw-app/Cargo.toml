@@ -22,7 +22,6 @@ gw-store.workspace = true
 gw-claude-subprocess.workspace = true
 gw-dario.workspace = true
 gw-cursor.workspace = true
-gw-node.workspace = true
 tokio.workspace = true
 axum.workspace = true
 tower-http.workspace = true
@@ -39,8 +38,6 @@ tracing-subscriber.workspace = true
 parking_lot.workspace = true
 uuid.workspace = true
 sha2.workspace = true
-# 安装包下载用 ReaderStream 流式发文件(只在 /node-bundle 用)。
-tokio-util = { version = "0.7", features = ["io"] }
 regex.workspace = true
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }

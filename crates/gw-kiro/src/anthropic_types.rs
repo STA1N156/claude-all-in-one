@@ -91,7 +91,7 @@ impl Thinking {
     /// 🟢 借鉴 static_flow `exposes_anthropic_thinking`(types.rs:79),但口径对齐我方:
     /// - `enabled`:总是暴露(客户端显式要 thinking)。
     /// - `adaptive`:仅当 `display=="summarized"`(客户端要思考摘要)或带 `output_config`
-    ///   (我方 override 给 Opus 默认开 adaptive 时会同时带 OutputConfig,代表"要思考")才暴露。
+    ///   (后缀开启思考时会同时带 OutputConfig,代表"要思考")才暴露。
     /// - 其它:不暴露。
     ///
     /// 解耦动机:`hidden_thinking = is_enabled && !exposes` —— 给上游开思考保智力,
@@ -178,7 +178,7 @@ impl OutputConfig {
 /// (全场最短),而它的加密体反而比 low 大 48%。要看深度就看签名长度和耗时。
 ///
 /// 这个值只在**客户端没说话**时用。显式点了 `max` 的请求照原样上 wire、不降级
-/// (见 `thinking_policy` 的 `client_max_effort_reaches_the_wire_undowngraded`)。
+    /// (见 `thinking_policy` 的 `explicit_effort_survives_all_three_api_conversions`)。
 ///
 /// 注意这是 caio 的**策略默认**,与"客户端给了脏值时回落到该模型 schema 的 `default`"
 /// 是两件事 —— 后者见 `thinking_policy::EffortWish::ModelDefault`。

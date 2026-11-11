@@ -6,7 +6,7 @@
 use serde_json::{json, Map, Value};
 
 use super::inbound::{
-    content_to_blocks, convert_tool_choice, convert_tools, copy_sampling, effort_to_thinking,
+    content_to_blocks, convert_tool_choice, convert_tools, copy_sampling, copy_reasoning,
     max_tokens_of, reconcile_tool_choice, session_metadata, tool_choice_forbids_tools,
     tool_output_to_content,
     ConvertError, SystemAccum,
@@ -121,13 +121,7 @@ pub fn convert_request(src: &Value) -> Result<Converted, ConvertError> {
     if let Some(tc) = reconcile_tool_choice(has_tools, choice, "tool_choice")? {
         out.insert("tool_choice".into(), tc);
     }
-    if let Some(t) = obj
-        .get("reasoning_effort")
-        .and_then(Value::as_str)
-        .and_then(effort_to_thinking)
-    {
-        out.insert("thinking".into(), t);
-    }
+    copy_reasoning(obj, &mut out);
     copy_sampling(obj, &mut out);
     // 终端用户标识 → `metadata.user_id`。cursor 的会话派生**优先**读它,填上就绕开了
     // 「纯内容哈希」那条会把不同用户合并的脆弱路径(见 `session_metadata`)。

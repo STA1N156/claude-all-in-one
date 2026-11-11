@@ -18,9 +18,7 @@ pub(crate) mod accounts;
 mod groups;
 mod keys;
 mod logs;
-pub(crate) mod nodes;
 mod pool_breaker;
-mod restock;
 mod settings;
 mod usage;
 
@@ -69,8 +67,6 @@ pub fn admin_api_router(state: AdminState) -> Router {
         .merge(accounts::router())
         .merge(settings::router())
         .merge(logs::router())
-        .merge(restock::router())
-        .merge(nodes::router())
         .merge(pool_breaker::router())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
         .with_state(state)
@@ -231,9 +227,6 @@ pub(crate) mod tests_support {
         }
     }
 
-    /// CAIO_NODE_BUNDLE 是进程级环境变量:凡是要动它的测试都先抢这把锁
-    /// (admin::nodes 与 router 的安装包测试在同一个测试进程里跑)。
-    pub static BUNDLE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
 
 #[cfg(test)]

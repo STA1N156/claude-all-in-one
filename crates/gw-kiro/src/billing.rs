@@ -316,7 +316,7 @@ pub fn finalize(
         input: signals.billed_input(sim_total, tokenized),
         output: tokenized,
     };
-    let (input_total, output_tokens) = if ctx.policy.io_correction {
+    let (input_total, output_tokens) = if ctx.policy.io_correction && !ctx.cache_managed {
         (credit_basis.input, credit_basis.output)
     } else {
         (signals.legacy_input(sim_total), to_i32(output.legacy))
@@ -326,7 +326,7 @@ pub fn finalize(
             ctx.cache_profile
                 .as_ref()
                 .map(|profile| profile.finish(input_total).cache_read_tokens)
-                .unwrap_or(0)
+                .unwrap_or(signals.real_cache_read.max(0).min(i32::MAX as i64) as u32)
                 .min(input_total.max(0) as u32) as i32
         } else {
             sim_reported(input_total, &ctx.sim, &ctx.policy)
@@ -359,6 +359,10 @@ fn report_cache_read(
     basis: CreditBasis,
     sim: i32,
 ) -> (i32, Decision) {
+    // 新版生产路径只使用基础前缀缓存，旧积分策略不再覆盖命中结果。
+    if ctx.cache_managed {
+        return (sim, Decision::Sim);
+    }
     let p = &ctx.policy;
     let fit_only = match p.strategy.resolved() {
         CacheStrategy::Sim | CacheStrategy::Unknown => return (sim, Decision::Sim),

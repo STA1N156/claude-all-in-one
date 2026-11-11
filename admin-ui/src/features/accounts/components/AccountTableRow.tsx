@@ -109,12 +109,6 @@ export function AccountTableRow({
   // 只有 cursor 支持超额（与后端 on_demand_supported() 一致）。混部机器上这一列会
   // 同时出现 kiro 行，它们不该是可点的。
   const onDemandSupported = row.provider === 'cursor'
-  /** `extra.dario_node`:号所属子机;空/缺失 = 本机。 */
-  const darioNode =
-    typeof row.extra?.dario_node === 'string' && row.extra.dario_node.trim() !== ''
-      ? row.extra.dario_node.trim()
-      : null
-
   return (
     <TR>
       {/* account_id：代码字体 */}
@@ -157,13 +151,6 @@ export function AccountTableRow({
           {row.driver === 'wire' && (
             <Badge variant="warning" title={t('table.driverWireHint')}>
               {t('table.driverWire')}
-            </Badge>
-          )}
-          {/* 子机徽章:号固定在别的机器上(用那台机器的真实 IP 出网)。排查「这号为什么
-              选不中」时,第一件要知道的就是它在不在一台可能离线的子机上。 */}
-          {darioNode !== null && (
-            <Badge variant="muted" title={t('accounts.field.nodeHint')}>
-              {t('accounts.col.node')} {darioNode}
             </Badge>
           )}
           {/* 池钉徽章:bot/api 钉死后该号只烧对应的池,出问题时第二件要分辨的事。 */}

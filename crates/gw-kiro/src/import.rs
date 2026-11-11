@@ -319,18 +319,7 @@ pub(crate) fn map_api_key(key: &str, acc: Option<&Value>) -> Option<ImportedAcco
 /// apikey 条目的区号三兄弟。复用 [`insert_region_split`](同一份真理来源),但**只在导出
 /// 里真的带了区号信息时才写** —— 全缺就保持 extra 不含 region，与改动前逐字节等价。
 ///
-/// 为什么要这道「有才写」的闸:drop 那家的号不带区号,`restock::onboard` 走的就是这条路,
-/// 而 restock P1 敢单独上线的全部依据是「无区号的号经过新载荷后与裸串路径一模一样」
-/// (`gw-app/src/restock/engine.rs` 有钉死测试)。无条件写 `region: us-east-1` 虽然行为
-/// 等价(下游一律回落同一个默认值),却会推翻那条不变量,等于把一次只读的修复变成全量改号。
-///
-/// `profile_arn` 固定传 `None`:apikey 凭据**永不带 profileArn**(见
-/// [`crate::headers::resolve_profile_arn`]),服务端按 key 自身解析账号。即便号商在同一条
-/// 目里塞了一个 arn,我方也不会发它,拿它去覆盖显式 `apiRegion` 只会多一个意外来源。
-///
-/// 2026-10-22 生产事故:号商用 `{authRegion: us-east-1, apiRegion: eu-central-1}` 分离
-/// 导出(无扁平 `region`),而此前这里只读扁平 `region` 一个字段 → extra 无区号 →
-/// `usage_limits`/`chat` 双双回落 us-east-1 → 每个请求 403 → 面板「凭据失效」。
+/// 缺少区号字段时保持 extra 原样,沿用默认区域。
 fn insert_api_key_region_split(extra: &mut Map<String, Value>, acc: &Value) {
     // flat_region_str 已按 trim 判空(与 `profiles::candidate_regions`、`insert_region_split`
     // 内部同口径):纯空白的 region 不算「带了区号信息」。改动前它会被原样写进 extra,下游
@@ -1788,8 +1777,6 @@ mod tests {
     }
 
     /// **零行为变化的闸**:完全不带区号信息时 extra 里不得出现 region 三兄弟。
-    /// drop 的号就是这个形态,restock P1 敢单独上线的依据是「与裸串路径逐字节等价」
-    /// (`gw-app/src/restock/engine.rs` 有钉死测试),这里本地也钉一遍。
     #[test]
     fn apikey_without_region_info_is_unchanged() {
         let bare = parse_accounts_export(&json!(["ksk_a1234567", "ksk_b1234567"])).unwrap();

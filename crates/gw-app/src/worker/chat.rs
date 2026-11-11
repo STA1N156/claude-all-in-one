@@ -426,10 +426,6 @@ pub(super) async fn handle_chat(
         ci_wait_deadline: Some(retry_started + st.scheduler.cost_index_max_wait()),
     };
     let mut attempts = 0;
-    // 本轮选号是否有号因「此刻不可用」(所在子机离线/排空)被排除。用于把全滤空时的
-    // NoModelSupport(400「换模型」)改报 503:那是我方运行态问题,不是客户的模型选错了。
-    let unroutable_seen = std::sync::atomic::AtomicBool::new(false);
-
     loop {
         attempts += 1;
         // 1. 按会话亲和取并发租约(持有到流结束)。合格账号须支持本次模型
@@ -448,10 +444,6 @@ pub(super) async fn handle_chat(
                     if !st.provider.account_supports_model(a, &req.model)
                         || st.scheduler.is_model_unavailable(&a.account_id, &req.model)
                     {
-                        return false;
-                    }
-                    if !st.provider.account_routable(a) {
-                        unroutable_seen.store(true, std::sync::atomic::Ordering::Relaxed);
                         return false;
                     }
                     true
@@ -503,7 +495,6 @@ pub(super) async fn handle_chat(
                         continue;
                     }
                 }
-                let e = remap_unroutable(e, unroutable_seen.load(std::sync::atomic::Ordering::Relaxed));
                 let code = acquire_error_status(&e);
                 // 内部原因(哪一档耗尽 / 组里压根没成员)只进日志:它描述的是账号池形态,
                 // 对客户既没用又泄底。客户端只拿到"换模型"还是"稍后重试"。

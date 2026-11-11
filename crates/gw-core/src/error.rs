@@ -149,12 +149,8 @@ impl UpstreamErrorKind {
                 "服务暂时不可用,请稍后重试"
             }
             UpstreamErrorKind::TemporarilyBlocked => "服务暂时不可用,请稍后重试",
-            // 内部定性就是"对该内容的确定性空流(疑 guardrail)"——对外要给用户
-            // 可操作的信息(改内容/换模型),而不是一句看不出所以然的"重试"
-            // (2026-08-24 用户报障:opus-5 被封控时用户只看到裸断流)。覆盖两种
-            // 真实成因:内容安全审核(kiro)+ 不支持的输入(cursor 图片附件)。
             UpstreamErrorKind::EmptyResponse => {
-                "模型未对该请求产出任何内容:可能是内容触发了上游安全审核,或包含当前通道不支持的输入(如图片附件)。请调整内容或更换模型后重试"
+                "该请求内容违反了Anthropic相关条款限制，可能涉及了生物安全/网络安全/模型越狱等内容，无法继续进行，请切换至非Opus 5/5.5模型，详情参考https://support.claude.com/zh-CN/articles/16049681"
             }
             // 兜底文案;正常路径走 UpstreamError::content_filtered 带上游类别与说明。
             UpstreamErrorKind::ContentFiltered => {
@@ -523,11 +519,11 @@ mod tests {
         assert!(!hidden.client_message().contains("foo@bar"), "账号标识绝不能外泄");
     }
 
-    /// 全类别扫一遍:任何 kind 的中性文案都不许带厂商 / 接口指纹。
+    /// 除指定的空回复提示外,默认文案不含厂商 / 接口指纹。
     #[test]
     fn no_kind_leaks_vendor_fingerprint() {
         use UpstreamErrorKind as K;
-        const KINDS: [K; 12] = [
+        const KINDS: [K; 11] = [
             K::TokenInvalid,
             K::RateLimited,
             K::TemporarilyBlocked,
@@ -537,7 +533,6 @@ mod tests {
             K::Overloaded,
             K::BadRequest,
             K::ModelNotAvailable,
-            K::EmptyResponse,
             K::ContentFiltered,
             K::Other,
         ];

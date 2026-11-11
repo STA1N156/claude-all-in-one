@@ -25,7 +25,7 @@ type BoolSpec = Extract<SchedulerFieldSpec, { kind: 'bool' }>
  * 系统设置里的「调度器」段：算法选择 + 所选算法的参数。
  *
  * 受控组件，状态由 SettingsPage 持有、随主表单一起保存 —— 这些键都在 `/settings`
- * 的 overlay 里，与 RestockSettingsCard 那种独立端点不同，没必要自带保存按钮。
+ * 的 overlay 里，随主表单一起保存。
  */
 export function SchedulerAlgorithmCard({
   form,

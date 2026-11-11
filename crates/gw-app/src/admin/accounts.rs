@@ -108,7 +108,7 @@ pub(crate) enum EgressPicker {
 impl EgressPicker {
     /// ⚠️ 退回直连**必须报错**,不能像 2026-08-06 之前那样静默发生。
     ///
-    /// 那次的代价:`egress:"auto"` 遇到空池时无声变直连,42 个自动补货的号全部
+    /// 那次的代价:`egress:"auto"` 遇到空池时无声变直连,42 个新导入的账号全部
     /// 从服务器主 IP 出去,被 AWS 按出口 IP 关联,**59.5% 被 TEMPORARILY_SUSPENDED**
     /// (同期走代理池的 11 个号一个没封)。面板上一切正常,只有逐个翻账号的
     /// `extra.proxy` 才看得出来。请求方明确要了一个出口却拿到直连,是配置事故,
@@ -190,10 +190,6 @@ pub struct CreateAccountBody {
     /// 后端调 `gw_dario::parse_cc_credentials` 解析后并入 extra(不覆盖显式传的同名字段)。
     #[serde(default)]
     credentials_json: Option<String>,
-    /// claude-dario 专用:把号放到哪台子机(`extra.dario_node`)。只能在建号时指定,之后不可改;
-    /// 子机号不设出口代理(用子机本机 IP 直连)。
-    #[serde(default)]
-    node: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -619,27 +615,7 @@ async fn create_account(
         .and_then(|v| v.as_str())
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
-    // 子机号:用子机本机 IP 直连,不分配出口;目标组 worker 必须认得 `dario_node`。
-    let node = body
-        .node
-        .as_deref()
-        .or_else(|| extra_map.get(gw_core::node::NODE_EXTRA_KEY).and_then(|v| v.as_str()))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    if let Some(node) = &node {
-        if body.provider.as_deref() != Some("claude-dario") {
-            return api_error(StatusCode::BAD_REQUEST, "只有 claude-dario 号能放到子机上");
-        }
-        if has_proxy {
-            return api_error(StatusCode::BAD_REQUEST, "子机上的号用子机本机 IP 直连,不能再设出口代理");
-        }
-        if let Err(resp) = super::nodes::check_node_target(&st, node, body.group.as_deref().unwrap_or("")).await {
-            return resp;
-        }
-        extra_map.insert(gw_core::node::NODE_EXTRA_KEY.into(), serde_json::json!(node));
-    }
-    if !has_proxy && node.is_none() {
+    if !has_proxy {
         if let Some(url) = EgressPicker::build(&st.store, body.egress.as_deref()).next() {
             extra_map.insert("proxy".into(), serde_json::json!(url));
         }
@@ -712,8 +688,6 @@ struct PendingOAuth {
     verifier: String,
     /// 解析后的出口代理(None=组默认出口);换码与落库用同一值 → 铸=刷=发同 IP。
     proxy: Option<String>,
-    /// 子机号:换码经 hub 交给这台子机,用它自己的 IP 发出;此时 `proxy` 恒为 `None`。
-    node: Option<String>,
     account_id: String,
     group: String,
     max_concurrency: i64,
@@ -767,9 +741,6 @@ pub struct StartOAuthBody {
     egress: Option<String>,
     #[serde(default)]
     max_concurrency: Option<i64>,
-    /// 把号上到哪台子机。给了就不选出口:换码由子机用它自己的 IP 发出。
-    #[serde(default)]
-    node: Option<String>,
 }
 
 /// `POST /accounts/oauth/start` —— 生成 PKCE + authorize URL,登记待完成会话。
@@ -822,18 +793,7 @@ async fn oauth_start(
     // 出口解析:统一按 egress 选择(显式网关/自动均衡/直连)。direct=本机出口 IP——caio 各 worker
     // 均 network_mode:host 同机,故 direct 对该组所有 worker 是同一 IP;非 direct(proxy)则各 worker
     // 都用同一 proxy 串 → 同 IP。换码与落库用同一 proxy 值,铸=刷=发同 IP(见 client_for_proxy)。
-    let node = body.node.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-    if let Some(n) = &node {
-        if let Err(resp) = super::nodes::check_node_target(&st, n, &group).await {
-            return resp;
-        }
-    }
-    // 子机号不走出口池:铸 token、刷新、发包都在子机本机 IP 上。
-    let proxy: Option<String> = if node.is_some() {
-        None
-    } else {
-        EgressPicker::build(&st.store, body.egress.as_deref()).next()
-    };
+    let proxy = EgressPicker::build(&st.store, body.egress.as_deref()).next();
     let (verifier, challenge) = gw_dario::oauth::gen_pkce();
     let state = gw_dario::oauth::gen_state();
     let authorize_url = gw_dario::oauth::build_authorize_url(&challenge, &state);
@@ -842,7 +802,6 @@ async fn oauth_start(
         PendingOAuth {
             verifier,
             proxy,
-            node,
             account_id: body.account_id,
             group,
             max_concurrency: body.max_concurrency.unwrap_or(2),
@@ -899,22 +858,6 @@ async fn oauth_complete(
             insert_pending(body.state.clone(), pending);
             return internal_error(e);
         }
-    }
-    // 子机号:经 hub 交给那台子机换码(子机本机 IP),不扇给 worker。
-    if let Some(node) = pending.node.clone() {
-        let tokens = match super::nodes::node_oauth_exchange(&st, &node, &code, &pending.verifier, &body.state).await {
-            Ok(t) => t,
-            Err(super::nodes::NodeExchangeError::NotDelivered(msg)) => {
-                // code 没送到子机、仍然有效:保留会话,子机恢复后可直接重试。
-                insert_pending(body.state.clone(), pending);
-                return api_error(StatusCode::BAD_GATEWAY, &format!("子机暂不可达,上号会话已保留,请稍后重试({msg})"));
-            }
-            Err(super::nodes::NodeExchangeError::Failed(status, msg)) => {
-                let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-                return api_error(code, &msg);
-            }
-        };
-        return finish_oauth_account(&st, pending, tokens, &[]).await;
     }
     // 扇给**目标组**的 worker(account_group 匹配)——该 worker 的 egress = 该号将来 refresh/chat
     // 同一出口 IP。绝不扇给其它组(出口会错)。
@@ -991,7 +934,7 @@ async fn oauth_complete(
     finish_oauth_account(&st, pending, tokens, &workers).await
 }
 
-/// 换码成功后的落库:token 字段 + 出口 proxy(与换码同值)或所属子机 + 稳定身份,建号并捅 worker 同步。
+/// 换码成功后的落库:token 字段 + 出口 proxy(与换码同值) + 稳定身份,建号并捅 worker 同步。
 async fn finish_oauth_account(
     st: &AdminState,
     pending: PendingOAuth,
@@ -1015,9 +958,6 @@ async fn finish_oauth_account(
     }
     if let Some(p) = &pending.proxy {
         extra_map.insert("proxy".into(), serde_json::json!(p));
-    }
-    if let Some(n) = &pending.node {
-        extra_map.insert(gw_core::node::NODE_EXTRA_KEY.into(), serde_json::json!(n));
     }
     extra_map
         .entry("device_id".to_string())
@@ -1744,10 +1684,6 @@ async fn rebalance_egress(
     let mut counts: Vec<(String, usize)> = pool.iter().map(|u| (u.clone(), 0usize)).collect();
     let mut to_assign: Vec<String> = Vec::new();
     for row in &rows {
-        // 子机号用子机本机 IP,不参与出口池均衡。
-        if row_node(&row.extra).is_some() {
-            continue;
-        }
         let cur = account_proxy(&row.extra);
         let in_pool = cur.as_deref().map(|p| pool.iter().any(|u| u == p)).unwrap_or(false);
         if body.only_unassigned {
@@ -1891,12 +1827,6 @@ async fn update_account(
                 ));
             }
             Ok(UpdateAccountOutcome::Ok) => {}
-            Ok(UpdateAccountOutcome::NodeLocked) => {
-                return api_error(
-                    StatusCode::BAD_REQUEST,
-                    "号所属子机不可修改:同一个号的令牌只能有一个持有者。要换子机,请删号后在新子机重新登录。",
-                )
-            }
             Ok(UpdateAccountOutcome::NotFound) => {
                 return api_error(StatusCode::NOT_FOUND, "账号不存在")
             }
@@ -1929,9 +1859,6 @@ async fn update_account(
     // 非空 = 写入边界校验(非法直接 400,fail-closed 不静默回退裸 IP,审查 Skeptic#2)。
     if let Some(proxy) = &body.proxy_url {
         let trimmed = proxy.trim();
-        if !trimmed.is_empty() && account_node_of(&st, &id).is_some() {
-            return api_error(StatusCode::BAD_REQUEST, "子机上的号用子机本机 IP 直连,不能设出口代理");
-        }
         let proxy_val = if trimmed.is_empty() {
             serde_json::Value::Null
         } else {
@@ -2058,10 +1985,8 @@ async fn delete_account(
     State(st): State<AdminState>,
     Path(id): Path<String>,
 ) -> axum::response::Response {
-    let (is_dario, node) = match st.store.get_account(&id) {
-        Ok(Some(row)) => (row.provider == "claude-dario", row_node(&row.extra)),
-        _ => (false, None),
-    };
+    let is_dario = st.store.get_account(&id).ok().flatten()
+        .is_some_and(|row| row.provider == "claude-dario");
     match st.store.delete_account(&id) {
         Ok(true) => {
             // 立即让 worker 从内存移除(审查 Skeptic#4/Minimalist#5):否则删除后
@@ -2069,9 +1994,7 @@ async fn delete_account(
             poke_workers_sync(&st).await;
             // claude-dario:令牌在该号的 dario 进程里,一并让管理器停进程、删凭证目录。
             // best-effort:管理器不可达只告警,号在 caio 侧已删,不会再被路由到。
-            if let Some(node) = &node {
-                super::nodes::delete_on_node(&st, node, &id).await;
-            } else if is_dario {
+            if is_dario {
                 let d = &st.yaml_config.dario;
                 let base = if d.sidecar_url.trim().is_empty() { gw_dario::DEFAULT_SUPERVISOR_URL } else { d.sidecar_url.as_str() };
                 if let Err(e) = gw_dario::supervisor::delete_account(base, &d.api_key, &id).await {
@@ -2083,21 +2006,6 @@ async fn delete_account(
         Ok(false) => api_error(StatusCode::NOT_FOUND, "账号不存在"),
         Err(e) => internal_error(e),
     }
-}
-
-/// 号所属子机(extra JSON 里的 `dario_node`)。
-pub(crate) fn row_node(extra: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(extra)
-        .ok()?
-        .get(gw_core::node::NODE_EXTRA_KEY)?
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
-fn account_node_of(st: &AdminState, id: &str) -> Option<String> {
-    st.store.get_account(id).ok().flatten().and_then(|r| row_node(&r.extra))
 }
 
 /// best-effort 捅所有 worker 立即从 DB 同步账号集(导入/删除后消除 30s 生效窗口)。

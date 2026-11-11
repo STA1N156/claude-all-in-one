@@ -385,7 +385,7 @@ pub fn sync_with_store(store: &gw_store::SqliteStore) -> Option<String> {
     sync_breaker_with_store(&STATE, store)
 }
 
-/// 读库里两个键并合成一份视图(worker 对账、router 管理接口、补货暂停共用)。
+/// 读库里两个键并合成一份视图(worker 对账和 router 管理接口共用)。
 /// 文档坏了按空处理并记日志:worker 侧会用内存状态把坏文档覆盖掉。
 pub fn load_stored(store: &gw_store::SqliteStore) -> anyhow::Result<StoredState> {
     let mut doc = match store.get_kv(STATE_KEY)? {
@@ -445,35 +445,6 @@ fn sync_breaker_with_store(state: &Mutex<Breaker>, store: &gw_store::SqliteStore
             let trip = Trip { at: doc.tripped_at.unwrap_or_default(), events: doc.events };
             notify.then(|| format!("caio 号池熔断,已暂停接单,请到后台查看并手动恢复。{}", describe(&trip)))
         }
-    }
-}
-
-/// 熔断通知:复用补货的回调地址(`restock_params.notify_url`,面板「补货」里填)。
-/// 没填就只有日志、`/health` 和后台横幅。发送失败只记日志,绝不影响熔断本身。
-pub async fn send_notify(store: &gw_store::SqliteStore, text: String) {
-    let url = store
-        .get_kv(gw_store::SqliteStore::KEY_RESTOCK_PARAMS)
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|v| v.get("notify_url").and_then(|u| u.as_str()).map(str::to_string))
-        .unwrap_or_default();
-    if url.trim().is_empty() {
-        tracing::info!("号池熔断:未配置通知地址(补货设置里的 notify_url),只记日志");
-        return;
-    }
-    let http = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(8)).build() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("号池熔断:通知客户端构造失败: {e}");
-            return;
-        }
-    };
-    let payload = serde_json::json!({"event": "pool_breaker", "ts": now_ms() / 1000});
-    match crate::restock::notify::send(&http, &url, &text, payload).await {
-        Ok(()) => tracing::info!("号池熔断:已发通知"),
-        // 地址里带着机器人 key,`notify::send` 已经把它从错误里剥掉了。
-        Err(e) => tracing::warn!("号池熔断:通知发送失败: {e}"),
     }
 }
 

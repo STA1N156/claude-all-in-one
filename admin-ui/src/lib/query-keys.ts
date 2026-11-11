@@ -40,20 +40,6 @@ export const queryKeys = {
     root: ['pool-breaker'] as const,
     status: () => ['pool-breaker', 'status'] as const,
   },
-  restock: {
-    /** 自动补货域根 key；开关/参数变更后整域 invalidate。 */
-    root: ['restock'] as const,
-    state: () => ['restock', 'state'] as const,
-    params: () => ['restock', 'params'] as const,
-    suppliers: () => ['restock', 'suppliers'] as const,
-    credits: (hours: number) => ['restock', 'credits', hours] as const,
-    accounts: () => ['restock', 'accounts'] as const,
-  },
-  nodes: {
-    /** 子机域根 key;吊销/排空后整域 invalidate。 */
-    root: ['nodes'] as const,
-    list: () => ['nodes', 'list'] as const,
-  },
   logs: {
     /** 请求日志域根 key。 */
     root: ['logs'] as const,

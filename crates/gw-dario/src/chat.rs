@@ -460,36 +460,7 @@ pub(crate) async fn chat_via_sidecar(
 
     if !status.is_success() {
         let code = status.as_u16();
-        // 子机号:hub 的标记(子机离线/排空/途中断开)与子机侧的阶段标记(ensure / dario
-        // 转发失败),都不是 Anthropic 的回答,先于状态码分类处理。
-        let mark = crate::supervisor::node_mark(resp.headers());
-        let stage = resp
-            .headers()
-            .get(gw_core::node::HDR_STAGE)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
         let text = resp.text().await.unwrap_or_default();
-        if let Some(mark) = mark {
-            return Err(crate::supervisor::node_mark_error(mark, &text));
-        }
-        match stage.as_deref() {
-            Some(gw_core::node::STAGE_ENSURE) => {
-                // 带 x-caio-stage: ensure 的回包只可能来自子机(本机路径不经过它)。
-                return Err(crate::supervisor::ensure_failure(&ctx.account.account_id, code, &text, true));
-            }
-            Some(gw_core::node::STAGE_DARIO) => {
-                // agent 自己产的 502/504(连不上 dario / dario 没回响应头)。这是远端基础设施
-                // 状态,不该计入账号健康(同 node_mark_error 的理由,用 RateLimited);
-                // 投递语义是 Unknown —— 请求可能已发到 dario,就地失败,不换号重发。
-                return Err(UpstreamError::new(
-                    UpstreamErrorKind::RateLimited,
-                    format!("子机转发 dario 失败({code}): {}", text.chars().take(200).collect::<String>()),
-                )
-                .with_delivery(gw_core::error::RequestDelivery::Unknown));
-            }
-            _ => {}
-        }
-        // Fix3: use classify_chat_status — bare 403 is BadRequest (not TokenInvalid).
         let kind = classify_chat_status(code, &text);
         return Err(UpstreamError::new(
             kind,

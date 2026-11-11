@@ -2290,7 +2290,7 @@ async fn 首项即错误_窥探后回真实错误状态() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = sse_body(resp).await;
     assert!(body.contains("invalid_request_error"), "{body}");
-    assert!(body.contains("安全审核"), "文案必须点出疑 guardrail: {body}");
+    assert!(body.contains("Anthropic相关条款限制"), "空回复使用指定提示: {body}");
     assert!(!body.contains("零内容产出"), "内部原文不外泄: {body}");
 }
 

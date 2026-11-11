@@ -36,7 +36,3 @@
 /.review-request-*.md
 # e2e 真号验证时 dump 出来的调试产物(含上百 MB 的测试二进制,勿入库)
 /.tmp-dump
-
-# 子机安装包的构建中间产物与产物(44MB 的 .run、bun 二进制、dario dist,勿入库)
-/.tmp-node-build
-/dist-node

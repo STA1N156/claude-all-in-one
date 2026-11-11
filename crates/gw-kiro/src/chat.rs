@@ -226,8 +226,7 @@ pub async fn chat_stream(
                 UpstreamError::bad_request_visible(format!("Anthropic 请求体解析失败: {e}"))
             })?;
 
-    // 1.5 块2a:按模型名覆写 thinking 配置(Opus 全系默认开 adaptive 保智力;
-    // 非 Opus 的 -thinking/-reasoning 后缀 enabled;结构化输出与 thinking 互斥)。🔵 kiro.rs 稳定经验。
+    // 显式思考参数优先，其次 -thinking/-reasoning 后缀，普通模型名默认关闭。
     crate::thinking_policy::override_thinking_from_model_name(&mut messages_req);
     let sim_total = crate::text_tokens::count_request_tokens(&req.body)
         .min(u32::MAX as u64) as u32;

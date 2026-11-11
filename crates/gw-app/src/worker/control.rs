@@ -56,9 +56,6 @@ pub(super) async fn health(State(st): State<Arc<WorkerState>>) -> impl IntoRespo
         "egress": st.egress_desc,
         "group": st.group,
         "provider": st.provider.family(),
-        // 本二进制具备的能力。admin 据此判断能不能做依赖新代码的操作(如把号上到子机:
-        // 老 worker 不认 `dario_node`,会把凭证交给本机管理器,与子机形成双持有)。
-        "capabilities": ["dario_nodes"],
         "accounts": st.scheduler.total(),
         // 每账号运行态(冷却/封禁/并发占用)+ 配额,admin 账号页经 router 聚合展示。
         "accounts_status": accounts_status,

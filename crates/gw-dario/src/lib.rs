@@ -6,7 +6,6 @@ mod cc;
 mod chat;
 mod credentials;
 mod datefmt;
-mod nodes;
 pub mod oauth;
 pub mod supervisor;
 mod token;
@@ -67,9 +66,6 @@ pub const DEFAULT_SUPERVISOR_URL: &str = "http://127.0.0.1:8788";
 pub struct DarioConfig {
     /// dario-supervisor 地址(历史键名;以前指单个注入式 sidecar)。
     pub sidecar_url: String,
-    /// 子机 hub 的本地口(子机号经它访问子机上的管理器)。来自 system.yaml 顶层
-    /// `node_hub_url`,不在 `dario` 段里(该段带 deny_unknown_fields,见 gw-core config)。
-    pub hub_url: String,
     /// 管理器鉴权与各 dario 进程的 DARIO_API_KEY 共用。
     pub api_key: String,
     /// dario 的 CC 模板数据文件(翻译成 Claude Code 报文用,见 [`cc`])。空 = 不翻译。
@@ -83,8 +79,6 @@ impl DarioConfig {
             sidecar_url: d.and_then(|v| v.get("sidecar_url")).and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty()).unwrap_or(DEFAULT_SUPERVISOR_URL).to_string(),
             api_key: d.and_then(|v| v.get("api_key")).and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            hub_url: cfg.get("node_hub_url").and_then(|v| v.as_str()).map(str::trim)
-                .filter(|s| !s.is_empty()).unwrap_or(gw_core::node::DEFAULT_HUB_URL).to_string(),
             // 顶层键(见 gw-core `SystemConfig::dario_cc_template_path`:dario 段带 deny_unknown_fields)。
             cc_template_path: cfg.get("dario_cc_template_path").and_then(|v| v.as_str())
                 .unwrap_or_default().trim().to_string(),
@@ -104,8 +98,6 @@ pub struct DarioProvider {
     proxy_clients: Mutex<HashMap<String, reqwest::Client>>,
     /// dario-supervisor 客户端:交接、出口同步、按号拿端口。
     sup: supervisor::Supervisor,
-    /// 子机上的号(`extra.dario_node`):经 hub 路由到子机上的管理器,并维护子机在线快照。
-    nodes: nodes::NodeRouter,
     /// 每账号 5h/7d 利用率快照:chat 从 sidecar 透传的 Anthropic 限额头捕获写入,
     /// `account_quota` 只读返回(OAuth/Max 无只读用量接口,只能从真实流量捕获)。
     ratelimit: chat::RateLimitStore,
@@ -140,17 +132,12 @@ impl DarioProvider {
             supervisor::Supervisor::new(DEFAULT_SUPERVISOR_URL, &cfg.api_key, sidecar_client.clone())
                 .expect("默认管理器地址合法")
         });
-        let hub_url = if cfg.hub_url.trim().is_empty() { gw_core::node::DEFAULT_HUB_URL } else { cfg.hub_url.as_str() };
-        let nodes = nodes::NodeRouter::new(hub_url, &cfg.api_key, sidecar_client.clone());
-        // 在 worker 的运行时里构造时就开始拉子机状态,第一个请求到来时快照已就绪。
-        nodes.ensure_poller();
         Self {
             cfg,
             sidecar_client,
             egress_client,
             proxy_clients: Mutex::new(HashMap::new()),
             sup,
-            nodes,
             ratelimit: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -288,20 +275,6 @@ impl Provider for DarioProvider {
         gw_core::envnorm::apply_for(self.family(), &mut req.body, &ctx.account);
         // 翻译成 Claude Code 报文(开关 off 时原样)。不支持的客户端在这里就本地拒绝,不交接、不发上游。
         let prepared = self.prepare_cc(&req.body)?;
-        if let Some(node) = gw_core::node::account_node(&ctx.account) {
-            // 子机号:交接走子机上的管理器;对话由子机在本机 ensure 后转给 dario(省一个往返)。
-            let sup = self.nodes.supervisor(node)?;
-            sup.provision(&ctx.account).await?;
-            let url = sup.node_chat_url(&ctx.account.account_id, "/v1/messages");
-            let res = chat::chat_via_sidecar(&self.cfg, &self.sidecar_client, self.ratelimit.clone(), req, prepared, ctx, &url).await;
-            if let Err(e) = &res {
-                // 没发出去的失败(子机离线、管理器里没这个号……):下次重新核对交接状态。
-                if !e.delivery.may_have_executed() {
-                    sup.forget(&ctx.account.account_id);
-                }
-            }
-            return res;
-        }
         self.sup.provision(&ctx.account).await?;
         let port = self.sup.ensure(&ctx.account.account_id).await?;
         let url = self.sup.process_url(port, "/v1/messages");
@@ -338,14 +311,6 @@ impl Provider for DarioProvider {
         m
     }
 
-    /// 子机号:所在子机在线且没被排空才参与选号(快照每 2 秒从 hub 拉一次)。本机号恒可用。
-    fn account_routable(&self, account: &Account) -> bool {
-        match gw_core::node::account_node(account) {
-            Some(node) => self.nodes.routable(node),
-            None => true,
-        }
-    }
-
     /// 配额是本地廉价读(从聊天流量捕获的内存快照,无上游往返)→ 告诉 gw-app 别拿"昂贵调用"
     /// 的 TTL 节流(尤其别让陈旧 None 挡住刚捕获的快照,见 Provider::quota_is_local)。
     fn quota_is_local(&self) -> bool {
@@ -360,16 +325,7 @@ impl Provider for DarioProvider {
     /// 不必等第一个请求(Provider 没有「号新增」钩子)。交接失败只记日志,不影响读快照。
     async fn account_quota(&self, account: &Account) -> Result<Option<gw_core::provider::AccountQuota>, UpstreamError> {
         if !account.disabled {
-            let res = match gw_core::node::account_node(account) {
-                // 子机离线时不去交接(必然失败,每轮刷一条告警没有意义),等它回来再说。
-                Some(node) if !self.nodes.routable(node) => Ok(()),
-                Some(node) => match self.nodes.supervisor(node) {
-                    Ok(sup) => sup.provision(account).await,
-                    Err(e) => Err(e),
-                },
-                None => self.sup.provision(account).await,
-            };
-            if let Err(e) = res {
+            if let Err(e) = self.sup.provision(account).await {
                 tracing::warn!(account = %account.account_id, error = %e, "dario 交接/出口同步失败(下次轮询重试)");
             }
         }
@@ -385,9 +341,7 @@ impl Provider for DarioProvider {
 
     /// 交接成功后待落库的 extra 增量:清空 refresh_token、记 dario_rev / 交接时间。
     fn poll_token_updates(&self) -> Vec<(String, std::collections::BTreeMap<String, serde_json::Value>)> {
-        let mut all = self.sup.drain_updates();
-        all.extend(self.nodes.drain_updates());
-        all
+        self.sup.drain_updates()
     }
 
     /// OAuth 上号:`authorization_code` → token set。

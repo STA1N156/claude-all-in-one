@@ -1,14 +1,11 @@
 //! claude-all-in-one 二进制入口。
 //!
 //! 单二进制多角色:`--mode all` / `--mode router` / `--mode worker --instance N`;
-//! 子机相关:`--mode hub`(主机上等子机来连)/ `--mode node`(子机)。
 //! 见 docs/ARCHITECTURE.md §1。
 
 mod admin;
 mod egress;
-mod node_modes;
 mod registry;
-mod restock;
 mod router;
 mod websearch;
 mod worker;
@@ -78,10 +75,6 @@ enum Mode {
     Router,
     /// 实际反代:绑定固定出口 + 管理一组账号。
     Worker,
-    /// 主机侧子机 hub:公网 TLS 口等子机来连,本地口把 worker/admin 的请求转进子机。
-    Hub,
-    /// 子机:主动连主机 hub,把主机的请求转给本机的 dario 管理器 / dario 进程。
-    Node,
 }
 
 #[derive(Debug, Parser)]
@@ -94,8 +87,6 @@ struct Args {
     /// worker 实例号(--mode worker 必填,对应 instances.yaml 的 instance)。
     #[arg(long)]
     instance: Option<u32>,
-
-
 
     /// instances.yaml 路径。
     #[arg(long, default_value = "config/instances.yaml")]
@@ -112,42 +103,6 @@ struct Args {
     /// SQLite 控制面路径。
     #[arg(long, default_value = "data/control.db")]
     db: PathBuf,
-
-    /// hub:子机连进来的公网监听地址。
-    #[arg(long, default_value = "0.0.0.0:38993")]
-    hub_listen: String,
-
-    /// hub:给本机 worker/admin 用的回环监听地址。
-    #[arg(long, default_value = "127.0.0.1:8790")]
-    hub_local: String,
-
-    /// hub:子机连主机用的地址(`host:port`),写进后台生成的完整令牌。
-    #[arg(long)]
-    public_addr: Option<String>,
-
-    /// hub:自签证书目录(要和库一起备份:证书变了所有子机都连不上)。
-    #[arg(long, default_value = "data/node-hub")]
-    cert_dir: PathBuf,
-
-    /// 子机:主机 hub 地址 `host:port`(也可用 CAIO_MASTER;完整令牌自带)。
-    #[arg(long)]
-    master: Option<String>,
-
-    /// 子机:主机证书指纹(也可用 CAIO_FP;完整令牌自带)。
-    #[arg(long)]
-    fp: Option<String>,
-
-    /// 子机:加入令牌(也可用 CAIO_TOKEN)。
-    #[arg(long)]
-    token: Option<String>,
-
-    /// 子机:安装 ID(也可用 CAIO_INSTALL_ID)。
-    #[arg(long)]
-    install_id: Option<String>,
-
-    /// 子机:本机 dario 管理器地址(也可用 CAIO_SUP_URL,默认 http://127.0.0.1:8788)。
-    #[arg(long)]
-    sup_url: Option<String>,
 }
 
 #[tokio::main]
@@ -194,29 +149,6 @@ async fn main() -> anyhow::Result<()> {
                 &args.db,
             )
             .await
-        }
-        Mode::Hub => {
-            tracing::info!(version = %node_modes::version(), "启动子机 hub 角色");
-            node_modes::run_hub(node_modes::HubArgs {
-                system: &args.system,
-                db: &args.db,
-                listen: args.hub_listen,
-                local: args.hub_local,
-                public_addr: args.public_addr,
-                cert_dir: args.cert_dir,
-            })
-            .await
-        }
-        Mode::Node => {
-            let opts = node_modes::node_options(node_modes::NodeArgs {
-                master: args.master,
-                fp: args.fp,
-                token: args.token,
-                install_id: args.install_id,
-                sup_url: args.sup_url,
-            })?;
-            tracing::info!(version = %opts.version, node = %opts.node_id, master = %opts.master, "启动子机角色");
-            gw_node::agent::run(opts).await
         }
     }
 }

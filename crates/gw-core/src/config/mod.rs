@@ -199,51 +199,6 @@ pub struct DarioSidecarConfig {
     pub api_key: String,
 }
 
-/// 自动补货(drop.kiro.ss 买 Kiro `ksk_` 号并自动上号)的**启动期**配置。
-///
-/// 这里只放三样:参与开关、上游地址、密钥。**运行时可调的策略参数一律不在这里**
-/// (水位/高峰窗口/日上限/预测参数……),它们存 control.db,面板改完即时生效无需重启。
-///
-/// 为什么这么切:热调参数的自然去处是 [`SystemSettings`],但那个结构体有一条**回滚地板**
-/// (见其注释)——给它加字段会让回滚到 2026-07-31 之前的镜像变成全量 503。补货参数走自己的
-/// 表天然避开,同时密钥也不会经 `GET /admin/api/settings` 回显给前端。
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RestockConfig {
-    /// 本进程是否参与补货。**默认 false** —— 没显式打开就绝不会有任何进程去花钱。
-    ///
-    /// 注意它不是"业务开关"(那个在面板上、存 DB),而是"这个二进制允不允许跑补货循环"。
-    /// 生产上多个 router 共用同一份 system.yaml,所以打开它之后**由 DB 租约决定谁真正跑**,
-    /// 不能靠这个字段做互斥。
-    pub enabled: bool,
-    /// drop 平台地址。空 → 回落 [`Self::DEFAULT_BASE_URL`]。
-    pub base_url: String,
-    /// drop 平台的 `X-API-Key`(`usr-` 开头)。空 → 视为未配置,循环不启动。
-    pub api_key: String,
-}
-
-impl RestockConfig {
-    pub const DEFAULT_BASE_URL: &'static str = "https://drop.kiro.ss";
-
-    /// 有效地址:空串回落默认,并去掉尾斜杠(拼路径时避免 `//api/...`)。
-    pub fn base_url(&self) -> &str {
-        let s = self.base_url.trim().trim_end_matches('/');
-        if s.is_empty() {
-            Self::DEFAULT_BASE_URL
-        } else {
-            s
-        }
-    }
-
-    /// 配置是否完整到可以启动补货循环。
-    ///
-    /// fail-closed:`enabled` 打开但密钥是空的 → **不启动**(而不是带着一个必然 401 的
-    /// 客户端空转),让启动日志把这件事说出来。
-    pub fn is_configured(&self) -> bool {
-        self.enabled && !self.api_key.trim().is_empty()
-    }
-}
-
 /// 思考强度档位。**闭集,由低到高**,序列化为小写串(与上游 enum 逐字一致)。
 ///
 /// 为什么是枚举而不是 `String`:这个值会**原样进 wire**
@@ -371,10 +326,6 @@ pub struct SystemConfig {
     /// **启动期参数**:worker 启动时一次性注入 provider 工厂;改后需重启相关 worker。
     #[serde(default)]
     pub dario: DarioSidecarConfig,
-    /// 自动补货(drop.kiro.ss 买 ksk_ 号并上号)。**启动期参数 + 密钥**;
-    /// 策略参数在 DB 里可热改。见 [`RestockConfig`]。
-    #[serde(default)]
-    pub restock: RestockConfig,
     /// **热追加/覆盖的 cursor 模型目录**(默认空 = 纯内置目录)。
     ///
     /// cursor 上游不提供菜单查询,模型表只能内置;但「新模型能不能用」又只能靠实测。
@@ -430,28 +381,12 @@ pub struct SystemConfig {
     /// (后者让上游每轮整段重写提示缓存)。默认关。**只影响 cursor 家族。**
     #[serde(default)]
     pub cursor_blob_history: bool,
-    /// 子机 hub 的本地口(worker / admin 经它访问子机上的 dario)。空 = 默认
-    /// [`crate::node::DEFAULT_HUB_URL`]。
-    ///
-    /// 放在**顶层**而不是 `dario` 段:`DarioSidecarConfig` 带 `deny_unknown_fields`,
-    /// 所有容器共用一份 system.yaml,往那里加字段会让还没升级的老镜像起不来。
-    /// 顶层没有 deny,老镜像会忽略它。
-    #[serde(default)]
-    pub node_hub_url: String,
     /// dario 的 CC 模板数据(dario 产物里的 `dist/cc-template-data.json`,只读挂进 worker-dario)。
     /// 翻译成 Claude Code 报文时用其中的版本、身份行、CC 工具定义与字段顺序 —— 跟着 dario 升级走,
     /// 不在 caio 里硬编码。空 / 读不到 = 不翻译(行为同 `dario_cc_translate=off`)。
     ///
-    /// 与 [`Self::node_hub_url`] 同理放在**顶层**:`dario` 段带 `deny_unknown_fields`,只升级
-    /// worker-dario 时其余老镜像读到新字段会起不来。
     #[serde(default)]
     pub dario_cc_template_path: String,
-    /// 子机远端 bash(/exec)的独立钥匙。与 dario.api_key 分开:后者的持有面太广
-    /// (管理器、worker、每个 dario 进程),不能让它等于「全舰队的 shell」。
-    /// 空 = exec 关闭(fail-closed)。也可用环境变量 CAIO_EXEC_KEY(子机 hub 容器
-    /// 共享这份 system.yaml,不需要单独传参)。同样放**顶层**(老镜像会忽略它)。
-    #[serde(default)]
-    pub node_exec_key: Option<String>,
     /// Claude Code 自动模式安全分类器请求的处理方式(省钱开关,默认关)。
     /// 详见 [`crate::config::automode`]。同样放**顶层**(老镜像会忽略它)。
     #[serde(default)]
@@ -469,31 +404,6 @@ pub struct SystemConfig {
     #[serde(default)]
     pub pool_breaker: crate::config::pool_breaker::PoolBreakerConfig,
 }
-
-impl SystemConfig {
-    /// 有效的 hub 本地口地址。
-    pub fn effective_node_hub_url(&self) -> &str {
-        let s = self.node_hub_url.trim();
-        if s.is_empty() {
-            crate::node::DEFAULT_HUB_URL
-        } else {
-            s
-        }
-    }
-
-    /// 有效的 exec 钥匙:yaml 优先,环境变量 CAIO_EXEC_KEY 兜底;两头都空 = exec 关闭。
-    pub fn effective_node_exec_key(&self) -> Option<String> {
-        let from_yaml = self.node_exec_key.as_deref().unwrap_or("").trim();
-        if !from_yaml.is_empty() {
-            return Some(from_yaml.to_string());
-        }
-        std::env::var("CAIO_EXEC_KEY").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-    }
-}
-
-
-
-
 
 /// 一个热追加的 cursor 模型条目(见 [`SystemConfig::cursor_extra_models`])。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1030,7 +940,7 @@ pub struct SchedulerConfig {
     pub tier_hold_window_ms: u64,
     /// **低优先新号暖机**总开关(默认开):调度 rank >= 100 的号按号龄(accounts.created_at)
     /// 获得更低的有效 RPM 上限;rank < 100 的高优号(成员边 @0 的 POWER/PRO MAX 等)
-    /// 完全不受影响。背景:restock 补货的新号一上线就被鲸客流量瞬时灌满
+    /// 完全不受影响。背景:新导入的账号一上线就被鲸客流量瞬时灌满
     /// (2026-08-10 ha7477062:新号几分钟内打到封号),上游对新号的节奏容忍远低于老号。
     ///
     /// 有效 RPM = min(账号 `extra.rpm_limit`, 暖机上限) —— 暖机只收紧、**绝不放宽**
@@ -1070,7 +980,7 @@ pub struct SchedulerConfig {
     /// 号龄 < `hours`)有效 RPM 收紧到 `rpm`;`hours = 0` = 该组**显式关闭暖机**。
     /// 未列出的分组走上面的全局两期暖机(由 `warmup_enabled` 总管)。
     ///
-    /// 背景:全局暖机是为 kiro 补货新号设计的(2026-08-10 ha7477062),但它按 rank
+    /// 背景:全局暖机是为 kiro 新导入的账号设计的(2026-08-10 ha7477062),但它按 rank
     /// 一刀切,把 cursor 订阅号也限到了 2 RPM(2026-08-11 CUR 组 503 事故)。分组策略
     /// 让「哪个组要保护、保护多狠、保护多久」可按业务线分别拍板,互不拖累。
     #[serde(default)]
@@ -1181,7 +1091,7 @@ fn default_tier_hold_ms() -> u64 {
 fn default_tier_hold_window_ms() -> u64 {
     0
 }
-/// 暖机默认**开启**:补货新号是封号重灾区,默认保护;高优号不受影响,老号(>24h)无感。
+/// 暖机默认**开启**:新导入的账号是封号重灾区,默认保护;高优号不受影响,老号(>24h)无感。
 fn default_warmup_enabled() -> bool {
     true
 }
@@ -1996,33 +1906,6 @@ mod tests {
         assert_eq!(cfg2.dario.api_key, "local-key");
     }
 
-    #[test]
-    fn restock_config_defaults_and_parse() {
-        // 缺省:不参与补货、无密钥。这条最重要——默认值必须是"不花钱"。
-        let d = RestockConfig::default();
-        assert!(!d.enabled);
-        assert!(!d.is_configured());
-        assert_eq!(d.base_url(), RestockConfig::DEFAULT_BASE_URL);
-
-        // 老 system.yaml 缺 restock 段 → 默认,不拒绝启动(顶层无 deny_unknown_fields)。
-        let cfg: SystemConfig = serde_yaml::from_str("upstream_timeout_secs: 600\n").unwrap();
-        assert!(!cfg.restock.enabled);
-
-        // enabled 但没密钥 → fail-closed,不算配置完整(否则会带着必然 401 的客户端空转)。
-        let half = "restock:\n  enabled: true\n";
-        let cfg2: SystemConfig = serde_yaml::from_str(half).unwrap();
-        assert!(cfg2.restock.enabled);
-        assert!(!cfg2.restock.is_configured());
-
-        // 完整配置。尾斜杠要被去掉,否则拼路径出 `//api/me/stock`。
-        let yaml = "restock:\n  enabled: true\n  base_url: \"https://drop.kiro.ss/\"\n  api_key: \"usr-abc\"\n";
-        let cfg3: SystemConfig = serde_yaml::from_str(yaml).unwrap();
-        assert!(cfg3.restock.is_configured());
-        assert_eq!(cfg3.restock.base_url(), "https://drop.kiro.ss");
-
-        // 段内拼错字段当场报错(deny_unknown_fields),不静默忽略。
-        assert!(serde_yaml::from_str::<SystemConfig>("restock:\n  enabeld: true\n").is_err());
-    }
 
     #[test]
     fn parse_instances_with_local_ip_and_proxy() {

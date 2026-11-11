@@ -388,8 +388,7 @@ pub async fn run(
                 // 设置 overlay 解析失败会 `continue` 跳过本轮,而熔断的恢复不能被它卡住。
                 if super::pool_breaker::enabled() {
                     if let Some(text) = super::pool_breaker::sync_with_store(&store) {
-                        let store = store.clone();
-                        tokio::spawn(async move { super::pool_breaker::send_notify(&store, text).await });
+                        tracing::warn!("{text}");
                     }
                 }
                 // 热应用 DB 设置 overlay:代理/计费/图像(provider)+ 调度参数 + cache_sim。
@@ -663,7 +662,7 @@ pub async fn run(
     Ok(())
 }
 /// provider 工厂 cfg:注入有效 cache(缓存计费)+ image(图像压缩,"image" 子对象)+
-/// 可选 default_proxy(全局默认出口代理)+ dario 段 + 顶层的 `node_hub_url` / `dario_cc_template_path`。
+/// 可选 default_proxy(全局默认出口代理)+ dario 段 + 顶层的 `dario_cc_template_path`。
 /// 序列化失败退回缺省(provider 各自回退,不致命)。
 ///
 /// provider 只看得到这里放进去的键:system.yaml 新增的顶层键必须在这里显式带上,否则
@@ -680,10 +679,6 @@ fn provider_cfg(effective_system: &SystemConfig, default_proxy: Option<&str>) ->
         if let Ok(dario) = serde_json::to_value(&effective_system.dario) {
             map.insert("dario".into(), dario);
         }
-        map.insert(
-            "node_hub_url".into(),
-            serde_json::json!(effective_system.effective_node_hub_url()),
-        );
         map.insert(
             "dario_cc_template_path".into(),
             serde_json::json!(effective_system.dario_cc_template_path),
@@ -705,13 +700,11 @@ mod tests {
     /// 2026-11-01 上线后发现:`dario_cc_template_path` 没进 provider 工厂 cfg,dario 拿到空路径,
     /// 开关切到 on 也不翻译(模板指纹恒为 null)。顶层键都得在这里显式带上。
     #[test]
-    fn provider_cfg_带上顶层的子机与模板键() {
+    fn provider_cfg_带上顶层的模板键() {
         let mut sys = SystemConfig::default();
         sys.dario_cc_template_path = "/app/dario/cc-template-data.json".into();
-        sys.node_hub_url = "http://127.0.0.1:8790".into();
         let cfg = provider_cfg(&sys, Some("http://proxy:1"));
         assert_eq!(cfg["dario_cc_template_path"], "/app/dario/cc-template-data.json");
-        assert_eq!(cfg["node_hub_url"], "http://127.0.0.1:8790");
         assert_eq!(cfg["default_proxy"], "http://proxy:1");
         assert!(cfg.get("dario").is_some() && cfg.get("image").is_some());
     }

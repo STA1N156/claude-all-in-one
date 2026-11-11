@@ -94,15 +94,6 @@ fn acquire_error_status_忙429_没号503_模型400() {
     assert_eq!(acquire_error_status(&A::NoModelSupport), StatusCode::BAD_REQUEST);
 }
 
-/// 号都因所在子机离线/排空被排除:对外 503(稍后重试),不能是 400「换模型」。
-#[test]
-fn unroutable_only_turns_no_model_support_into_503() {
-    use scheduler::AcquireError as A;
-    assert_eq!(acquire_error_status(&remap_unroutable(A::NoModelSupport, true)), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(acquire_error_status(&remap_unroutable(A::NoModelSupport, false)), StatusCode::BAD_REQUEST);
-    assert_eq!(remap_unroutable(A::AllBusy, true), A::AllBusy, "忙就是忙,不改");
-}
-
 /// 上游自己发来的 error 载荷若没带 type,也要补上。
 #[test]
 fn sanitizing_upstream_payload_fills_missing_type() {

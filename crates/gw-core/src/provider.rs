@@ -329,15 +329,6 @@ pub trait Provider: Send + Sync {
         true
     }
 
-    /// 该账号此刻能不能接请求(与模型无关的运行态,如所在子机离线/被排空)。默认都能。
-    ///
-    /// 与 [`Self::account_supports_model`] 分开:后者全滤空时对外是 400「换模型」,
-    /// 而本钩子全滤空是我方运行态问题,worker 会改报 503。**必须无副作用且快**:
-    /// 调度器在锁内对每个候选账号调用。
-    fn account_routable(&self, _account: &Account) -> bool {
-        true
-    }
-
     /// 刷新账号凭据(token),返回更新后的 `Account`。
     ///
     /// **回写契约(H4)**:返回的 `Account` 由 **gw-app 负责写回 store**;provider

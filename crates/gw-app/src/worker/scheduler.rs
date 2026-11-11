@@ -101,7 +101,7 @@ struct Tuning {
 
 /// 低优先新号暖机参数(由 [`SchedulerConfig`] 的 `warmup_*` 字段注入,随 update_tuning 热更)。
 ///
-/// 背景(2026-08-10 ha7477062):restock 补货的新号一上线就被鲸客流量瞬时灌满,
+/// 背景(2026-08-10 ha7477062):新导入的账号一上线就被鲸客流量瞬时灌满,
 /// 几分钟打到封号 —— 上游对新号的节奏容忍远低于老号。于是低优先号(调度 rank >=
 /// [`WARMUP_MIN_RANK`])按号龄分两期限速:适应期(0 ~ phase1_hours)RPM = phase1_rpm,
 /// 爬坡期(phase1_hours ~ phase2_hours)RPM = phase2_rpm,之后毕业恢复账号自身配置。
@@ -112,9 +112,9 @@ struct Tuning {
 /// queue_probe / queue_stats / 状态快照)统一走它,口径不分叉。
 ///
 /// `group_policies`(2026-08-11 加):按分组覆盖全局两期暖机 —— 全局那套是为 kiro
-/// 补货新号设计的,但按 rank 一刀切会把 cursor 订阅号也限到 2 RPM(CUR 组 503 事故)。
+/// 新账号设计的,但按 rank 一刀切会把 cursor 订阅号也限到 2 RPM(CUR 组 503 事故)。
 /// 命中策略的组完全由策略接管(含 `hours=0` 显式关闭);未列出的组走全局,kiro 的
-/// 补货保护不变。`Arc` 让热更克隆是 O(1)。
+/// 新账号保护不变。`Arc` 让热更克隆是 O(1)。
 #[derive(Clone)]
 struct WarmupTuning {
     /// 总开关(false = 与本功能引入前逐字节等价)。
@@ -143,7 +143,7 @@ const CURSOR_PROVIDER: &str = "cursor";
 ///
 /// `group`(2026-08-11):命中 `group_policies` 的组由该策略**完全接管**(单期,
 /// `hours=0` = 该组显式关闭暖机),全局开关与两期参数对该组不再生效;
-/// 未命中的组走全局两期,kiro 补货保护不变。
+/// 未命中的组走全局两期,kiro 新账号保护不变。
 fn warmup_phase_cap(
     created_at: i64,
     rank: i64,
@@ -608,7 +608,7 @@ impl CredentialState {
     }
 
     /// 本号的暖机阶段与上限。**cursor 号一律不暖机**(2026-11-07 用户要求):暖机是为 kiro
-    /// 补货新号防封设计的,cursor 订阅号没有这个问题,限了只会让新号接不到量。
+    /// 新账号防封设计的,cursor 订阅号没有这个问题,限了只会让新号接不到量。
     /// 写死在代码里而不是靠 `warmup_group_policies` 逐组覆盖 —— 新开的 cursor 组不会漏。
     fn warmup_cap(
         &self,
@@ -1403,7 +1403,7 @@ impl AccountScheduler {
             // 配置停用的号不水合运行态冷却/观察期:人工停用优先,免得冷却到期后
             // 自行爬回流量池(对抗审查高#5)。**例外:retired 行必须水合**——
             // 自动退役落库本来就是 disabled=1 + retired 行的组合,跳过会让重启后的
-            // 退役号丢掉原因(面板不再显示已退役、restock 无法判死回收,二轮高#3)。
+            // 退役号丢掉原因(面板不再显示已退役,二轮高#3)。
             if e.config_disabled && lc.reason.as_deref() != Some("suspended_retired") {
                 continue;
             }
@@ -4119,7 +4119,7 @@ impl AccountScheduler {
                     if queue_enabled(&e.account) {
                         // 排队号(企业共享池)空响应不下线:它的空响应多为跨租户拥挤的
                         // 上游抖动(与 429 同哲学——唯一 hold 下线信号是 403 suspend)。
-                        // 下线会缩小健康池、让 restock 把"假冷却"当成缺口一直买号。
+                        // 下线会误缩小健康账号池。
                         // 只重置窗口计数,号留在轮转里;真毒报文有 poison_memo 多账号
                         // 确认机制兜底,不靠冷却防扩散(EmptyResponse 本来就不换号)。
                         e.empty_window_start = None;
@@ -5415,7 +5415,7 @@ mod tests {
 
     // ─────────────────── 低优先新号暖机(动态有效 RPM)───────────────────
     //
-    // 背景(2026-08-10 ha7477062):补货新号上线即被鲸客流量瞬时灌满,几分钟封号。
+    // 背景(2026-08-10 ha7477062):新账号上线即被鲸客流量瞬时灌满,几分钟封号。
     // 低优先号(rank >= 100)按号龄两期限速:0~2h RPM=2(适应期),2~24h RPM=6(爬坡期),
     // >24h 毕业。有效 RPM = min(extra.rpm_limit, 暖机上限),高优号完全豁免。
 
@@ -5628,7 +5628,7 @@ mod tests {
         assert_eq!(warmup_phase_cap(now - 5 * 3600, 100, &w, now, Some("CUR")), None, "策略到期毕业");
         // hours=0 = 该组显式关闭暖机(刚出生也不限)。
         assert_eq!(warmup_phase_cap(now, 100, &w, now, Some("OFF")), None);
-        // 未列出的组走全局两期,kiro 补货保护不变。
+        // 未列出的组走全局两期,kiro 新账号保护不变。
         assert_eq!(warmup_phase_cap(now, 100, &w, now, Some("G0")), Some((0, 2)));
         // 高优号即使组有策略也豁免(rank 闸在策略查找之前)。
         assert_eq!(warmup_phase_cap(now, 0, &w, now, Some("CUR")), None);
@@ -6393,7 +6393,7 @@ mod tests {
 
     /// 退役行水合不受配置停用守卫影响(二轮高#3):自动退役落库的形态本来就是
     /// `accounts.disabled=1` + retired 生命周期行,重启后必须恢复"已退役"原因——
-    /// 否则面板不再显示已退役、restock 无法判死回收。
+    /// 否则面板不再显示已退役。
     #[test]
     fn hydration_restores_retired_even_when_config_disabled() {
         let mut m = HashMap::new();
@@ -6448,7 +6448,7 @@ mod tests {
     }
 
     /// 排队号空响应**不下线**(与 429 同哲学:企业共享池的空响应多是跨租户拥挤,
-    /// 下线缩小健康池 → restock 把假冷却当缺口一直买号);非排队号维持阈值冷却。
+    /// 下线会误缩小健康账号池);非排队号维持阈值冷却。
     #[tokio::test]
     async fn queue_account_does_not_cool_down_on_empty_response() {
         let cfg = SchedulerConfig {

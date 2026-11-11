@@ -8,7 +8,6 @@ members = [
     "crates/gw-claude-subprocess",
     "crates/gw-dario",
     "crates/gw-cursor",
-    "crates/gw-node",
 ]
 
 [workspace.package]
@@ -25,7 +24,6 @@ gw-store = { path = "crates/gw-store" }
 gw-claude-subprocess = { path = "crates/gw-claude-subprocess" }
 gw-dario = { path = "crates/gw-dario" }
 gw-cursor = { path = "crates/gw-cursor" }
-gw-node = { path = "crates/gw-node" }
 async-stream = "0.3"
 
 # 异步运行时与 HTTP（版本对齐旧 kiro.rs，便于资产搬运）

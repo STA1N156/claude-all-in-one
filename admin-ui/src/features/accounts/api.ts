@@ -53,11 +53,6 @@ export interface OAuthStartPayload {
   /** 出口网关选择：""/"direct"=直连；"auto"=自动均衡；数字=egress_pool 索引。 */
   egress?: string
   max_concurrency?: number
-  /**
-   * 放到哪台子机(空=本机)。给了就不选出口:换码由那台子机用它自己的 IP 发出,
-   * 该号之后的刷新与对话也都在那台机器上。上号后不可改。
-   */
-  node?: string
 }
 
 export interface OAuthStartResult {

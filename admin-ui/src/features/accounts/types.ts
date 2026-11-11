@@ -108,11 +108,6 @@ export interface CreateAccountPayload {
    * 后端解析 claudeAiOauth 块并并入 extra（access_token / refresh_token / expires_at）。
    */
   credentials_json?: string
-  /**
-   * claude-dario 专用:把号放到哪台子机(`extra.dario_node`)。
-   * 只能建号时指定,之后不可改;子机号不设出口代理(用子机本机 IP 直连)。
-   */
-  node?: string
 }
 
 /**

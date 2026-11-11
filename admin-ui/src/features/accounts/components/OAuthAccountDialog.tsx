@@ -5,7 +5,6 @@ import { Button } from '@/components/ui/button'
 import { Modal } from '@/components/ui/modal'
 import { Select } from '@/components/ui/select'
 import { useGroups } from '@/features/groups/hooks'
-import { useNodes } from '@/features/nodes/hooks'
 import { useSettings } from '@/features/settings/hooks'
 import { extractErrorMessage, getErrorStatus } from '@/lib/api'
 import { copyText } from '@/lib/clipboard'
@@ -48,9 +47,6 @@ export function OAuthAccountDialog({ open, onClose }: OAuthAccountDialogProps) {
   const groupsQuery = useGroups()
   const settingsQuery = useSettings()
   const gateways = settingsQuery.data?.egress_pool ?? []
-  // 子机列表:没部署 hub 时查询会失败,nodes 为空 → 下面那个下拉根本不渲染,行为与以前一致。
-  const nodesQuery = useNodes()
-  const nodes = nodesQuery.data?.nodes ?? []
   const startMutation = useOAuthStart()
   const completeMutation = useOAuthComplete()
   const createMutation = useCreateAccount()
@@ -59,8 +55,6 @@ export function OAuthAccountDialog({ open, onClose }: OAuthAccountDialogProps) {
   const [group, setGroup] = useState('')
   const [concurrency, setConcurrency] = useState('2')
   const [egress, setEgress] = useState('direct')
-  /** 放到哪台子机('' = 本机)。选了子机就不选出口:换码/刷新/发包都在那台机器上。 */
-  const [node, setNode] = useState('')
   // 步骤2 状态:start 成功后填入 authorize URL + state。
   const [authorizeUrl, setAuthorizeUrl] = useState('')
   const [state, setState] = useState('')
@@ -77,7 +71,6 @@ export function OAuthAccountDialog({ open, onClose }: OAuthAccountDialogProps) {
       setGroup('')
       setConcurrency('2')
       setEgress('direct')
-      setNode('')
       setAuthorizeUrl('')
       setState('')
       setCode('')
@@ -117,8 +110,7 @@ export function OAuthAccountDialog({ open, onClose }: OAuthAccountDialogProps) {
         provider: 'claude-dario',
         group: group !== '' ? group : undefined,
         max_concurrency: validated.concurrency,
-        egress: node !== '' ? undefined : egress,
-        node: node !== '' ? node : undefined,
+        egress,
         credentials_json: credentialsJson.trim(),
       },
       {
@@ -143,8 +135,7 @@ export function OAuthAccountDialog({ open, onClose }: OAuthAccountDialogProps) {
       {
         account_id: accountId,
         group: group !== '' ? group : undefined,
-        egress: node !== '' ? undefined : egress,
-        node: node !== '' ? node : undefined,
+        egress,
         max_concurrency: validated.concurrency,
       },
       {
@@ -247,37 +238,13 @@ export function OAuthAccountDialog({ open, onClose }: OAuthAccountDialogProps) {
               />
             </div>
 
-            {nodes.length > 0 && (
-              <div className="space-y-1.5">
-                <label htmlFor="oauth-node" className="text-xs font-medium text-muted-foreground">
-                  {t('accounts.field.node')}
-                </label>
-                <Select
-                  id="oauth-node"
-                  value={node}
-                  onChange={(event) => setNode(event.target.value)}
-                  className="w-full"
-                >
-                  <option value="">{t('accounts.field.nodeLocal')}</option>
-                  {nodes.map((n) => (
-                    <option key={n.id} value={n.id}>
-                      {n.name !== '' ? n.name : n.id}
-                      {n.online ? '' : ` ${t('accounts.field.nodeOffline')}`}
-                    </option>
-                  ))}
-                </Select>
-                <p className="text-xs text-muted-foreground">{t('accounts.field.nodeHint')}</p>
-              </div>
-            )}
-
             <div className="space-y-1.5">
               <label htmlFor="oauth-egress" className="text-xs font-medium text-muted-foreground">
                 {t('accounts.field.egress')}
               </label>
               <Select
                 id="oauth-egress"
-                value={node !== '' ? 'direct' : egress}
-                disabled={node !== ''}
+                value={egress}
                 onChange={(event) => setEgress(event.target.value)}
                 className="w-full"
               >
@@ -290,7 +257,7 @@ export function OAuthAccountDialog({ open, onClose }: OAuthAccountDialogProps) {
                 ))}
               </Select>
               <p className="text-xs text-muted-foreground">
-                {node !== '' ? t('accounts.field.nodeHint') : t('accounts.oauth.egressHint')}
+                {t('accounts.oauth.egressHint')}
               </p>
             </div>
 

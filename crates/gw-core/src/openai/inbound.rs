@@ -305,13 +305,34 @@ pub fn reconcile_tool_choice(
 pub fn effort_to_thinking(effort: &str) -> Option<Value> {
     let budget = match effort.trim().to_ascii_lowercase().as_str() {
         // OpenAI 的 "minimal"/"none" 是明确的「别想」。
-        "none" | "minimal" => return Some(json!({"type": "disabled"})),
+        "none" | "minimal" | "off" | "disabled" => return Some(json!({"type": "disabled"})),
         "low" => 4_096,
         "medium" => 16_384,
-        "high" => 32_768,
+        "high" | "xhigh" | "max" => 32_768,
         _ => return None,
     };
     Some(json!({"type": "enabled", "budget_tokens": budget}))
+}
+
+/// 两种 OpenAI 入口共用：保留原始强度，避免经 budget 换算后 low/max 失真。
+pub fn copy_reasoning(src: &Map<String, Value>, dst: &mut Map<String, Value>) {
+    for key in ["thinking", "output_config"] {
+        if let Some(value) = src.get(key).filter(|v| v.is_object()) {
+            dst.insert(key.into(), value.clone());
+        }
+    }
+    let effort = src.get("reasoning_effort")
+        .and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+        .or_else(|| src.get("reasoning")?.get("effort")?.as_str());
+    let Some(effort) = effort else { return; };
+    let effort = effort.trim().to_ascii_lowercase();
+    let effort = if effort == "minimal" { "low" } else { effort.as_str() };
+    let Some(thinking) = effort_to_thinking(effort) else { return; };
+    dst.insert("thinking".into(), thinking);
+    if !["none", "off", "disabled"].contains(&effort) {
+        let config = dst.entry("output_config").or_insert_with(|| json!({}));
+        config.as_object_mut().unwrap().insert("effort".into(), json!(effort));
+    }
 }
 
 /// 采样参数直通(两种入站共用):同名同义的原样搬,不同名的按下表改名。

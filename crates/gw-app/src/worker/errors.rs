@@ -72,15 +72,6 @@ pub(super) fn anthropic_error_type(kind: UpstreamErrorKind) -> &'static str {
     error_type_for_status(upstream_status(kind))
 }
 
-/// 能服务该模型的号都因「此刻不可用」(子机离线/排空)被排除时,调度器只看到合格集为空、
-/// 报 NoModelSupport;对外那是 400「换模型」,语义不对 —— 改成 AllDisabled(503,稍后重试)。
-pub(super) fn remap_unroutable(e: scheduler::AcquireError, unroutable_seen: bool) -> scheduler::AcquireError {
-    match e {
-        scheduler::AcquireError::NoModelSupport if unroutable_seen => scheduler::AcquireError::AllDisabled,
-        other => other,
-    }
-}
-
 /// 选号失败原因 → 对外状态码。
 ///
 /// 独立成函数的理由:① 映射本身可单测(下次有人改回去编译器+测试一起拦);

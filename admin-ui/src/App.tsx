@@ -7,9 +7,7 @@ import ApiKeysPage from '@/pages/ApiKeysPage'
 import DashboardPage from '@/pages/DashboardPage'
 import GroupsPage from '@/pages/GroupsPage'
 import LoginPage from '@/pages/LoginPage'
-import NodesPage from '@/pages/NodesPage'
 import RequestLogsPage from '@/pages/RequestLogsPage'
-import RestockPage from '@/pages/RestockPage'
 import SettingsPage from '@/pages/SettingsPage'
 import UsagePage from '@/pages/UsagePage'
 
@@ -30,8 +28,6 @@ export default function App() {
           <Route path="accounts" element={<AccountsPage />} />
           <Route path="keys" element={<ApiKeysPage />} />
           <Route path="groups" element={<GroupsPage />} />
-          <Route path="restock" element={<RestockPage />} />
-          <Route path="nodes" element={<NodesPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="logs" element={<RequestLogsPage />} />
         </Route>

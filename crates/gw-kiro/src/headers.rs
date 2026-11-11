@@ -317,7 +317,7 @@ fn kiro_idp(account: &Account) -> Option<&str> {
 ///
 /// 判定顺序(先中先得):
 /// 1. `extra.price_class` 显式指定 `enterprise` / `personal`(运维手动覆盖);
-/// 2. ksk_ API Key 凭据(补货买的贵号池)→ 企业;
+/// 2. ksk_ API Key 凭据(API Key 账号池)→ 企业;
 /// 3. `auth_method = external_idp`(Azure AD 企业 SSO)→ 企业;
 /// 4. `kiro_provider ∈ {enterprise, internal}` → 企业;
 /// 5. `kiro_provider ∈ {builderid, builder-id, aws, github, google}` → 个人 ——
@@ -442,7 +442,7 @@ mod tests {
         // 社交号。
         assert!(!is_enterprise_priced(&account_with(json!({"kiro_provider": "google", "auth_method": "social"}))));
         assert!(!is_enterprise_priced(&account_with(json!({"kiro_provider": "github"}))));
-        // ksk_ API Key(补货贵号池)、external_idp、internal → 企业。
+        // ksk_ API Key(API Key 账号池)、external_idp、internal → 企业。
         assert!(is_enterprise_priced(&account_with(json!({"kiro_api_key": "ksk_abc", "auth_method": "api_key"}))));
         assert!(is_enterprise_priced(&account_with(json!({"auth_method": "external_idp"}))));
         assert!(is_enterprise_priced(&account_with(json!({"kiro_provider": "internal"}))));

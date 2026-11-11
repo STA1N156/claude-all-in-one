@@ -95,7 +95,7 @@ pub struct Account {
     /// 是否禁用。
     #[serde(default)]
     pub disabled: bool,
-    /// 建档时刻(Unix 秒,来自 accounts.created_at;对 restock 补货号≈上游激活时间)。
+    /// 建档时刻(Unix 秒,来自 accounts.created_at;对 新导入的账号≈上游激活时间)。
     /// 低优先新号暖机按它算号龄。**0 = 未知**(accounts.yaml 降级加载/手工构造):
     /// 未知号龄按「已毕业」处理、不暖机 —— fail-open 到引入暖机前的既有行为,
     /// 绝不因元数据缺失把老号误判成新号限流。

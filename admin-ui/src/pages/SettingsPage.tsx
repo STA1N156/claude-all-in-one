@@ -4,7 +4,6 @@ import { Info, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { ErrorNote } from '@/components/ui/error-note'
-import { RestockSettingsCard } from '@/features/restock/components/RestockSettingsCard'
 import { AutoModeCard } from '@/features/settings/components/AutoModeCard'
 import {
   BatchGuardCard,
@@ -12,7 +11,7 @@ import {
   batchGuardToForm,
   type BatchGuardForm,
 } from '@/features/settings/components/BatchGuardCard'
-import { CacheStrategyCard } from '@/features/settings/components/CacheStrategyCard'
+import { LocalCacheCard } from '@/features/settings/components/LocalCacheCard'
 import {
   PoolBreakerCard,
   poolBreakerPatch,
@@ -31,13 +30,6 @@ import { SchedulerAlgorithmCard } from '@/features/settings/components/Scheduler
 import { WorkerEffectiveCard } from '@/features/settings/components/WorkerEffectiveCard'
 import { useSettings, useUpdateSettings } from '@/features/settings/hooks'
 import {
-  buildCacheStrategyPatch,
-  cacheStrategyFormFromSettings,
-  hasCacheStrategyErrors,
-  validateCacheStrategyForm,
-  type CacheStrategyForm,
-} from '@/features/settings/cacheStrategy'
-import {
   buildSchedulerPatch,
   schedulerFormFromSettings,
   validateSchedulerForm,
@@ -48,9 +40,7 @@ import type {
   AutoModeClassifier,
   SystemSettings,
   SystemSettingsPatch,
-  ThinkingEffort,
 } from '@/features/settings/types'
-import { THINKING_EFFORTS } from '@/features/settings/types'
 import { useI18n } from '@/lib/i18n'
 
 const inputClass =
@@ -68,12 +58,6 @@ interface FormState {
   default_proxy: string
   /** 出口池:文本框,每行一个代理 URL(提交时拆分成数组)。 */
   egress_pool: string
-  cache_enabled: boolean
-  cache_read_multiplier: string
-  cache_cap_ratio: string
-  cache_floor_ratio: string
-  cache_sim_ttl_secs: string
-  cache_max_sessions: string
   rate_limit_cooldown_secs: string
   suspended_cooldown_secs: string
   empty_response_cooldown_secs: string
@@ -103,14 +87,12 @@ interface FormState {
   agent_continuation: boolean
   thinking_signature: boolean
   q_endpoint: boolean
-  default_thinking_effort: ThinkingEffort
   /** 历史 thinking 保留轮数(0=全丢/默认;N>0=最近 N 轮;负=全保留)。 */
   history_thinking_turns: string
   /** CC 自动模式安全分类器:off / haiku / allow。 */
   auto_mode_classifier: AutoModeClassifier
   auto_mode_classifier_model: string
   /** 保底只给总输入 ≥ 本值的请求(0 = 全部保底)。 */
-  cache_floor_min_input: string
   /** 批量任务拦截(表单形态见 BatchGuardCard)。 */
   batch_guard: BatchGuardForm
   /** 号池熔断(表单形态见 PoolBreakerCard)。 */
@@ -121,12 +103,6 @@ function settingsToForm(s: SystemSettings): FormState {
   return {
     default_proxy: s.default_proxy ?? '',
     egress_pool: (s.egress_pool ?? []).join('\n'),
-    cache_enabled: s.cache_enabled ?? true,
-    cache_read_multiplier: String(s.cache_read_multiplier),
-    cache_cap_ratio: String(s.cache_cap_ratio),
-    cache_floor_ratio: String(s.cache_floor_ratio),
-    cache_sim_ttl_secs: String(s.cache_sim_ttl_secs),
-    cache_max_sessions: String(s.cache_max_sessions),
     rate_limit_cooldown_secs: String(s.rate_limit_cooldown_secs),
     suspended_cooldown_secs: String(s.suspended_cooldown_secs),
     empty_response_cooldown_secs: String(s.empty_response_cooldown_secs),
@@ -158,14 +134,11 @@ function settingsToForm(s: SystemSettings): FormState {
     agent_continuation: s.agent_continuation,
     thinking_signature: s.thinking_signature ?? true,
     q_endpoint: s.q_endpoint ?? false,
-    // 后端总会回灌该字段;真缺了(旧版本后端)退回 high,与后端基线一致。
-    default_thinking_effort: s.default_thinking_effort ?? 'high',
     // 同口径:旧版本后端不返回时按基线 0(全丢)显示。
     history_thinking_turns: String(s.history_thinking_turns ?? 0),
     // 旧版本后端不返回这三项 → 按后端基线默认显示(与 buildPatch 的比较口径一致)。
     auto_mode_classifier: s.auto_mode_classifier ?? 'off',
     auto_mode_classifier_model: s.auto_mode_classifier_model ?? 'claude-haiku-4-5',
-    cache_floor_min_input: String(s.cache_floor_min_input ?? 0),
     batch_guard: batchGuardToForm(s),
     pool_breaker: poolBreakerToForm(s),
   }
@@ -195,23 +168,8 @@ function buildPatch(form: FormState, original: SystemSettings): SystemSettingsPa
     patch.egress_pool = poolLines.length === 0 ? null : poolLines
   }
 
-  // 浮点数字段
-  const floatFields: Array<[keyof FormState, keyof SystemSettings]> = [
-    ['cache_read_multiplier', 'cache_read_multiplier'],
-    ['cache_cap_ratio', 'cache_cap_ratio'],
-    ['cache_floor_ratio', 'cache_floor_ratio'],
-  ]
-  for (const [fk, sk] of floatFields) {
-    const parsed = parseFloat(form[fk] as string)
-    if (!isNaN(parsed) && parsed !== (original[sk] as number)) {
-      ;(patch as Record<string, unknown>)[sk] = parsed
-    }
-  }
-
   // 整数字段
   const intFields: Array<[keyof FormState, keyof SystemSettings]> = [
-    ['cache_sim_ttl_secs', 'cache_sim_ttl_secs'],
-    ['cache_max_sessions', 'cache_max_sessions'],
     ['rate_limit_cooldown_secs', 'rate_limit_cooldown_secs'],
     ['suspended_cooldown_secs', 'suspended_cooldown_secs'],
     ['empty_response_cooldown_secs', 'empty_response_cooldown_secs'],
@@ -234,7 +192,6 @@ function buildPatch(form: FormState, original: SystemSettings): SystemSettingsPa
 
   // 布尔字段
   const boolFields: Array<keyof SystemSettings & keyof FormState> = [
-    'cache_enabled',
     'quota_poll_enabled',
     'image_enabled',
     'tools_in_prefix',
@@ -297,13 +254,6 @@ function buildPatch(form: FormState, original: SystemSettings): SystemSettingsPa
     patch.warmup_group_policies = policyMap
   }
 
-  // 枚举字段(档位):只在变了才回传。比较对象必须与 settingsToForm 同一口径地补默认值 ——
-  // 直接跟原始响应比，遇到不返回该字段的旧后端就会 `'high' !== undefined` 恒成立，于是
-  // 哪怕用户只改了代理也会捎带这个字段，被旧后端的 deny_unknown_fields 判 400，整个保存失败。
-  if (form.default_thinking_effort !== (original.default_thinking_effort ?? 'high')) {
-    patch.default_thinking_effort = form.default_thinking_effort
-  }
-
   // 自动模式分类器三项:同一口径(与补过默认值的基线比,不跟原始响应比)。
   if (form.auto_mode_classifier !== (original.auto_mode_classifier ?? 'off')) {
     patch.auto_mode_classifier = form.auto_mode_classifier
@@ -315,13 +265,6 @@ function buildPatch(form: FormState, original: SystemSettings): SystemSettingsPa
     }
   }
 
-  // 小请求保底阈值:同「新增字段」口径(旧后端不返回 → 按基线 0 比较,非法输入不提交)。
-  {
-    const v = strictInt(form.cache_floor_min_input)
-    if (v !== null && v !== (original.cache_floor_min_input ?? 0)) {
-      patch.cache_floor_min_input = v
-    }
-  }
   // 批量任务拦截:只回传变了的键(比较口径与 batchGuardToForm 的默认值一致)。
   Object.assign(patch, batchGuardPatch(form.batch_guard, original))
   // 号池熔断:同口径。
@@ -350,8 +293,6 @@ export default function SettingsPage() {
   const [form, setForm] = useState<FormState | null>(null)
   /** 调度器段(算法 + 参数)的表单态;字段元数据与增量 patch 逻辑在 features/settings/scheduler.ts。 */
   const [schedulerForm, setSchedulerForm] = useState<SchedulerForm | null>(null)
-  /** 缓存计费策略段;表单逻辑在 features/settings/cacheStrategy.ts。 */
-  const [cacheStrategyForm, setCacheStrategyForm] = useState<CacheStrategyForm | null>(null)
   /** 报文环境标准化段;表单逻辑在 features/settings/envNormalize.ts。 */
   const [envNormalizeForm, setEnvNormalizeForm] = useState<EnvNormalizeForm | null>(null)
   const [saved, setSaved] = useState(false)
@@ -363,7 +304,6 @@ export default function SettingsPage() {
     if (data !== undefined && form === null) {
       setForm(settingsToForm(data))
       setSchedulerForm(schedulerFormFromSettings(data))
-      setCacheStrategyForm(cacheStrategyFormFromSettings(data))
       setEnvNormalizeForm(envNormalizeFormFromSettings(data))
     }
   }, [data, form])
@@ -379,12 +319,6 @@ export default function SettingsPage() {
   }
   const schedulerErrors =
     schedulerForm !== null && data !== undefined ? validateSchedulerForm(schedulerForm, data) : {}
-  const cacheStrategyErrors =
-    cacheStrategyForm !== null ? validateCacheStrategyForm(cacheStrategyForm) : { rows: {} }
-  const changeCacheStrategy = (next: CacheStrategyForm) => {
-    setSaved(false)
-    setCacheStrategyForm(next)
-  }
   const envNormalizeErrors = envNormalizeForm !== null ? validateEnvNormalizeForm(envNormalizeForm) : {}
   const changeEnvNormalize = (next: EnvNormalizeForm) => {
     setSaved(false)
@@ -429,7 +363,7 @@ export default function SettingsPage() {
 
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault()
-    if (!form || !schedulerForm || !cacheStrategyForm || !envNormalizeForm || !data || mutation.isPending) return
+    if (!form || !schedulerForm || !envNormalizeForm || !data || mutation.isPending) return
 
     // 两期顺序守卫(对抗审核 [中]):phase2 < phase1 时 phase2 永远命不中
     // (号龄到 phase1 后直接毕业),存进去就是一份静默失效的配置。
@@ -444,10 +378,6 @@ export default function SettingsPage() {
       setFormError(t('settings.schedulerAlgo.invalidSubmit'))
       return
     }
-    if (hasCacheStrategyErrors(cacheStrategyErrors)) {
-      setFormError(t('settings.cacheStrategy.invalidSubmit'))
-      return
-    }
     if (hasEnvNormalizeErrors(envNormalizeErrors)) {
       setFormError(t('settings.envNormalize.invalidSubmit'))
       return
@@ -457,7 +387,6 @@ export default function SettingsPage() {
     const patch = {
       ...buildPatch(form, data),
       ...buildSchedulerPatch(schedulerForm, data),
-      ...buildCacheStrategyPatch(cacheStrategyForm, data),
       ...buildEnvNormalizePatch(envNormalizeForm, data),
     }
     if (Object.keys(patch).length === 0) {
@@ -469,7 +398,6 @@ export default function SettingsPage() {
       onSuccess: (newData) => {
         setForm(settingsToForm(newData))
         setSchedulerForm(schedulerFormFromSettings(newData))
-        setCacheStrategyForm(cacheStrategyFormFromSettings(newData))
         setEnvNormalizeForm(envNormalizeFormFromSettings(newData))
         setSaved(true)
         if (savedTimerRef.current !== null) clearTimeout(savedTimerRef.current)
@@ -498,12 +426,11 @@ export default function SettingsPage() {
       {/* 加载失败 */}
       {loadError !== null && loadError !== undefined && <ErrorNote error={loadError} />}
 
-      {/* 自动补货：自成一体的一段（自己的 GET/PUT、自己的保存按钮）。
-          放在主 <form> 之外 —— 塞进去会被主表单的 submit 裹挟。 */}
       {/* 「我保存的到底生效没有」——放在改设置的同一页，不用切页也不用 SSH。 */}
       <WorkerEffectiveCard workers={data?.workers} desired={data} />
 
-      <RestockSettingsCard />
+
+      <LocalCacheCard />
 
       <form onSubmit={handleSubmit} className="space-y-6">
         {/* ── 代理 ── */}
@@ -545,123 +472,6 @@ export default function SettingsPage() {
             </div>
           </CardContent>
         </Card>
-
-        {/* ── 缓存 ── */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">{t('settings.section.cache')}</CardTitle>
-          </CardHeader>
-          <CardContent className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            <label className="flex cursor-pointer items-start gap-3 sm:col-span-2 lg:col-span-3">
-              <input
-                type="checkbox"
-                checked={form?.cache_enabled ?? true}
-                onChange={(e) => set('cache_enabled', e.target.checked)}
-                disabled={isLoading || form === null}
-                className="mt-0.5 h-4 w-4 rounded"
-              />
-              <span>
-                <span className="block text-sm font-medium">{t('settings.field.cacheEnabled')}</span>
-                <span className="block text-xs text-muted-foreground">
-                  {t('settings.field.cacheEnabledHint')}
-                </span>
-              </span>
-            </label>
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">
-                {t('settings.field.cacheReadMultiplier')}
-              </label>
-              <input
-                type="number"
-                step="any"
-                min={0}
-                value={form?.cache_read_multiplier ?? ''}
-                onChange={(e) => set('cache_read_multiplier', e.target.value)}
-                disabled={isLoading || form === null}
-                className={inputClass}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">
-                {t('settings.field.cacheCapRatio')}
-              </label>
-              <input
-                type="number"
-                step="any"
-                min={0}
-                value={form?.cache_cap_ratio ?? ''}
-                onChange={(e) => set('cache_cap_ratio', e.target.value)}
-                disabled={isLoading || form === null}
-                className={inputClass}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">
-                {t('settings.field.cacheFloorRatio')}
-              </label>
-              <input
-                type="number"
-                step="any"
-                min={0}
-                value={form?.cache_floor_ratio ?? ''}
-                onChange={(e) => set('cache_floor_ratio', e.target.value)}
-                disabled={isLoading || form === null}
-                className={inputClass}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">
-                {t('settings.field.cacheFloorMinInput')}
-              </label>
-              <input
-                type="number"
-                step={1}
-                min={0}
-                value={form?.cache_floor_min_input ?? ''}
-                onChange={(e) => set('cache_floor_min_input', e.target.value)}
-                disabled={isLoading || form === null}
-                className={inputClass}
-              />
-              <p className="text-xs text-muted-foreground">{t('settings.field.cacheFloorMinInputHint')}</p>
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">
-                {t('settings.field.cacheSimTtlSecs')}
-              </label>
-              <input
-                type="number"
-                step={1}
-                min={0}
-                value={form?.cache_sim_ttl_secs ?? ''}
-                onChange={(e) => set('cache_sim_ttl_secs', e.target.value)}
-                disabled={isLoading || form === null}
-                className={inputClass}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">
-                {t('settings.field.cacheMaxSessions')}
-              </label>
-              <input
-                type="number"
-                step={1}
-                min={0}
-                value={form?.cache_max_sessions ?? ''}
-                onChange={(e) => set('cache_max_sessions', e.target.value)}
-                disabled={isLoading || form === null}
-                className={inputClass}
-              />
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* ── 缓存计费策略 ── */}
-        <CacheStrategyCard
-          form={cacheStrategyForm}
-          errors={cacheStrategyErrors}
-          disabled={isLoading || cacheStrategyForm === null}
-          onChange={changeCacheStrategy}
-        />
 
         {/* ── 报文环境标准化 ── */}
         <EnvNormalizeCard
@@ -1098,38 +908,6 @@ export default function SettingsPage() {
             <CardTitle className="text-base">{t('settings.section.thinking')}</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
-            <div>
-              <span className="mb-2 block text-sm font-medium">
-                {t('settings.field.defaultThinkingEffort')}
-              </span>
-              <div className="inline-flex flex-wrap gap-1 rounded-2xl border bg-muted p-1">
-                {THINKING_EFFORTS.map((level) => {
-                  const active = (form?.default_thinking_effort ?? 'high') === level
-                  return (
-                    <button
-                      key={level}
-                      type="button"
-                      disabled={isLoading || form === null}
-                      onClick={() => set('default_thinking_effort', level)}
-                      title={t(`settings.effort.${level}Hint`)}
-                      className={`rounded-xl px-3 py-1.5 text-sm transition-colors disabled:opacity-50 ${
-                        active
-                          ? 'bg-background font-medium text-foreground shadow-sm'
-                          : 'text-muted-foreground hover:text-foreground'
-                      }`}
-                    >
-                      {level}
-                    </button>
-                  )
-                })}
-              </div>
-              <p className="mt-2 text-xs text-muted-foreground">
-                {t('settings.field.defaultThinkingEffortHint')}
-              </p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                {t(`settings.effort.${form?.default_thinking_effort ?? 'high'}Hint`)}
-              </p>
-            </div>
             <div className="space-y-1.5">
               <label className="text-xs font-medium text-muted-foreground">
                 {t('settings.field.historyThinkingTurns')}

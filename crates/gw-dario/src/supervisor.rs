@@ -60,52 +60,12 @@ fn unreachable(e: reqwest::Error) -> UpstreamError {
     sup_err(UpstreamErrorKind::ServerError, format!("dario 管理器不可达: {e}"))
 }
 
-/// hub 给出的「子机不可用」标记 → 错误。
-///
-/// **三种标记一律用 `RateLimited`,绝不用 ServerError / Network。** 后两者在
-/// `scheduler::report_failure` 里同属一个分支,会累加 `failure_count`,满
-/// `max_failures`(默认 5)就把号打成 `TooManyFailures` **永久禁用**。子机按设计跑在
-/// NAT 后的小机器上,WAN 抖动是常态:一台子机连抖 5 次,就会把它上面那些**完好的**号
-/// 在主机侧禁掉,而且子机恢复后不会自愈 —— 远端基础设施的状态不该写进账号的病历。
-/// `RateLimited` 的语义正好:这个号现在用不了(它的机器不在)、过一会儿自己恢复、
-/// 不计入账号健康。
-///
-/// 区别只在**投递语义**:离线/禁用时请求一个字节都没发出去 → `NotSubmitted`,可以放心
-/// 换号重发;`Lost` 是请求已经进了隧道才断的 → `Unknown`,不能重发(子机可能已经执行、
-/// 已经烧了上游额度),这条请求就地失败。
-pub(crate) fn node_mark_error(mark: gw_core::node::NodeMark, detail: &str) -> UpstreamError {
-    let msg = format!("dario 子机不可用({}): {}", mark.as_str(), detail.chars().take(200).collect::<String>());
-    let delivery = if mark.not_submitted() { RequestDelivery::NotSubmitted } else { RequestDelivery::Unknown };
-    UpstreamError::new(UpstreamErrorKind::RateLimited, msg).with_delivery(delivery)
-}
-
-/// 响应头里的 hub 标记(没有 = 这是子机/管理器自己的回答)。
-pub(crate) fn node_mark(headers: &reqwest::header::HeaderMap) -> Option<gw_core::node::NodeMark> {
-    headers
-        .get(gw_core::node::HDR_NODE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(gw_core::node::NodeMark::parse)
-}
-
-/// 管理器 `ensure` 的非 200 回答 → 错误(本机直连与子机代为 ensure 共用)。
-///
-/// `on_node`:这次 ensure 是**子机上**的管理器做的。此时的失败(管理器崩了、端口段耗尽、
-/// 磁盘写不下凭证……)是那台远端机器的状态,不是这个号的健康问题 —— 按 ServerError 记
-/// 会累加 `failure_count` 把号禁掉(同 [`node_mark_error`] 的理由),所以改用
-/// `RateLimited`:换号、冷一会儿、不进账号病历。409(令牌真的失效)仍然照实报。
-pub(crate) fn ensure_failure(id: &str, code: u16, text: &str, on_node: bool) -> UpstreamError {
-    let infra = |msg: String| {
-        if on_node {
-            UpstreamError::new(UpstreamErrorKind::RateLimited, msg)
-                .with_delivery(RequestDelivery::NotSubmitted)
-        } else {
-            sup_err(UpstreamErrorKind::ServerError, msg)
-        }
-    };
+/// 管理器 ensure 失败时,请求尚未发往上游。
+fn ensure_failure(id: &str, code: u16, text: &str) -> UpstreamError {
     match code {
         409 => relogin(id, "dario 判定 refresh token 已失效"),
-        404 => infra(format!("dario 管理器里没有号 {id}(稍后重新交接)")),
-        _ => infra(format!("dario 管理器 ensure {code}: {text}")),
+        404 => sup_err(UpstreamErrorKind::ServerError, format!("dario 管理器里没有号 {id}(稍后重新交接)")),
+        _ => sup_err(UpstreamErrorKind::ServerError, format!("dario 管理器 ensure {code}: {text}")),
     }
 }
 
@@ -118,8 +78,6 @@ fn relogin(id: &str, why: &str) -> UpstreamError {
 
 pub(crate) struct Supervisor {
     base: reqwest::Url,
-    /// 子机上的管理器(经 hub 访问)时为子机 ID;本机管理器为 `None`。
-    node: Option<String>,
     api_key: String,
     client: reqwest::Client,
     /// account_id → (「rev|proxy」, 时间)。命中且未过期则跳过交接检查。
@@ -139,7 +97,6 @@ impl Supervisor {
         }
         Ok(Self {
             base,
-            node: None,
             api_key: api_key.to_string(),
             client,
             provisioned: Mutex::new(HashMap::new()),
@@ -148,58 +105,9 @@ impl Supervisor {
         })
     }
 
-    /// 子机上的管理器:经 hub 本地口 `<hub>/n/<节点>/sup` 访问。
-    pub fn for_node(hub_url: &str, node_id: &str, api_key: &str, client: reqwest::Client) -> anyhow::Result<Self> {
-        if !gw_core::node::valid_node_id(node_id) {
-            anyhow::bail!("子机 ID 非法: {node_id:?}");
-        }
-        let base = format!("{}/n/{node_id}/sup", hub_url.trim().trim_end_matches('/'));
-        let mut sup = Self::new(&base, api_key, client)?;
-        sup.node = Some(node_id.to_string());
-        Ok(sup)
-    }
-
-    #[cfg(test)]
-    pub fn node(&self) -> Option<&str> {
-        self.node.as_deref()
-    }
-
-    /// 子机号的对话地址:`<hub>/n/<节点>/a/<号>/<path>`,由子机在本机 ensure 后转给 dario。
-    pub fn node_chat_url(&self, id: &str, path: &str) -> String {
-        let mut url = self.base.clone();
-        {
-            let mut seg = url.path_segments_mut().expect("http(s) URL 可加路径段");
-            seg.pop_if_empty().pop(); // 去掉末尾的 "sup"
-            seg.push("a").push(id);
-            seg.extend(path.trim_start_matches('/').split('/'));
-        }
-        url.to_string()
-    }
-
-    /// 管理器调用的通用失败:先认 hub 标记,再按状态码。
-    fn http_error(&self, headers: &reqwest::header::HeaderMap, what: &str, code: u16, text: &str) -> UpstreamError {
-        if let Some(mark) = node_mark(headers) {
-            return node_mark_error(mark, text);
-        }
-        // 400 = 我们给的东西不合法(缺 deviceId、socks 代理……),换号也一样,不惩罚账号健康。
-        if code == 400 {
-            return sup_err(UpstreamErrorKind::BadRequest, format!("dario 管理器 {what} {code}: {text}"));
-        }
-        let msg = format!("dario 管理器 {what} {code}: {text}");
-        // 子机上的管理器出错 = 远端基础设施,不计入账号健康(同 node_mark_error 的理由)。
-        if self.node.is_some() {
-            return UpstreamError::new(UpstreamErrorKind::RateLimited, msg)
-                .with_delivery(RequestDelivery::NotSubmitted);
-        }
-        sup_err(UpstreamErrorKind::ServerError, msg)
-    }
-
-    /// 连不上管理器:本机是 ServerError;子机号连不上的是 hub(主机本地口),同样按「没发出去」换号。
-    fn unreachable(&self, e: reqwest::Error) -> UpstreamError {
-        match &self.node {
-            None => unreachable(e),
-            Some(n) => node_mark_error(gw_core::node::NodeMark::Offline, &format!("hub 不可达(子机 {n}): {e}")),
-        }
+    fn http_error(&self, what: &str, code: u16, text: &str) -> UpstreamError {
+        let kind = if code == 400 { UpstreamErrorKind::BadRequest } else { UpstreamErrorKind::ServerError };
+        sup_err(kind, format!("dario 管理器 {what} {code}: {text}"))
     }
 
     fn account_url(&self, id: &str, ensure: bool) -> reqwest::Url {
@@ -234,22 +142,19 @@ impl Supervisor {
             .timeout(SUPERVISOR_TIMEOUT)
             .send()
             .await
-            .map_err(|e| self.unreachable(e))?;
+            .map_err(unreachable)?;
         let code = resp.status().as_u16();
-        if node_mark(resp.headers()).is_none() {
-            match code {
-                404 => return Ok(None),
-                200 => {
-                    return resp.json::<Remote>().await.map(Some).map_err(|e| {
-                        sup_err(UpstreamErrorKind::ServerError, format!("dario 管理器返回无法解析: {e}"))
-                    })
-                }
-                _ => {}
+        match code {
+            404 => return Ok(None),
+            200 => {
+                return resp.json::<Remote>().await.map(Some).map_err(|e| {
+                    sup_err(UpstreamErrorKind::ServerError, format!("dario 管理器返回无法解析: {e}"))
+                });
             }
+            _ => {}
         }
-        let headers = resp.headers().clone();
         let text = resp.text().await.unwrap_or_default();
-        Err(self.http_error(&headers, "GET", code, &text))
+        Err(self.http_error("GET", code, &text))
     }
 
     async fn send_json(
@@ -266,16 +171,15 @@ impl Supervisor {
             .json(body)
             .send()
             .await
-            .map_err(|e| self.unreachable(e))?;
+            .map_err(unreachable)?;
         let code = resp.status().as_u16();
-        if code == 200 && node_mark(resp.headers()).is_none() {
+        if code == 200 {
             return resp.json::<Remote>().await.map_err(|e| {
                 sup_err(UpstreamErrorKind::ServerError, format!("dario 管理器返回无法解析: {e}"))
             });
         }
-        let headers = resp.headers().clone();
         let text = resp.text().await.unwrap_or_default();
-        Err(self.http_error(&headers, method.as_str(), code, &text))
+        Err(self.http_error(method.as_str(), code, &text))
     }
 
     /// 确保该号进程在跑,返回端口。每个请求调用一次。
@@ -287,13 +191,9 @@ impl Supervisor {
             .timeout(SUPERVISOR_TIMEOUT)
             .send()
             .await
-            .map_err(|e| self.unreachable(e))?;
+            .map_err(unreachable)?;
         let code = resp.status().as_u16();
-        let mark = node_mark(resp.headers());
         let text = resp.text().await.unwrap_or_default();
-        if let Some(mark) = mark {
-            return Err(node_mark_error(mark, &text));
-        }
         match code {
             200 => serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
@@ -302,9 +202,9 @@ impl Supervisor {
                 .ok_or_else(|| sup_err(UpstreamErrorKind::ServerError, format!("dario 管理器 ensure 返回无端口: {text}"))),
             409 | 404 => {
                 self.forget(id);
-                Err(ensure_failure(id, code, &text, self.node.is_some()))
+                Err(ensure_failure(id, code, &text))
             }
-            _ => Err(ensure_failure(id, code, &text, self.node.is_some())),
+            _ => Err(ensure_failure(id, code, &text)),
         }
     }
 
@@ -312,13 +212,6 @@ impl Supervisor {
     pub async fn provision(&self, account: &Account) -> Result<(), UpstreamError> {
         let id = account.account_id.as_str();
         let proxy = normalized_proxy(account)?;
-        // 子机号用子机本机 IP 直连:再配代理就等于换了出口,拒绝而不是默默照做。
-        if self.node.is_some() && proxy.is_some() {
-            return Err(sup_err(
-                UpstreamErrorKind::BadRequest,
-                format!("号 {id} 在子机上,不能再设出口代理(请清空 proxy)"),
-            ));
-        }
         let refresh_token = account.extra_str("refresh_token").map(str::trim).filter(|s| !s.is_empty());
         let handed_rev = account.extra_str(HANDOVER_REV_KEY).map(str::trim).filter(|s| !s.is_empty());
         let local_rev = refresh_token.map(rev_of).or_else(|| handed_rev.map(str::to_string));
