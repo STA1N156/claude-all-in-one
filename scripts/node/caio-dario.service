@@ -1,0 +1,39 @@
+[Unit]
+# 子机上的 dario 管理器:每个 Claude 订阅号一个原版 dario 进程(按需起、闲置停)。
+# 只听回环,不开放任何入站端口;号的令牌在 /var/lib/caio/dario 下,丢了要重新登录。
+Description=caio dario supervisor (per-account dario processes)
+Documentation=https://github.com/htesd/claude-all-in-one
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=caio
+Group=caio
+WorkingDirectory=/opt/caio
+EnvironmentFile=/etc/caio/node.env
+Environment=SUPERVISOR_HOST=127.0.0.1
+Environment=SUPERVISOR_PORT=8788
+Environment=DARIO_CLI=/opt/caio/dario/dist/cli.js
+Environment=BUN_BIN=/opt/caio/bin/bun
+Environment=DATA_DIR=/var/lib/caio/dario
+# 与主机出站闸(24MB)对齐,否则大附件请求到了子机才被拒。
+Environment=DARIO_MAX_BODY_MB=24
+Environment=HOME=/var/lib/caio
+ExecStart=/opt/caio/bin/bun /opt/caio/dario-supervisor/src/main.ts
+Restart=always
+RestartSec=3
+# mixed:SIGTERM 只给管理器,让它自己按顺序停各号的 dario(各自排空在途请求),
+# 超时后 SIGKILL 整个 cgroup,不留孤儿 bun 进程。
+KillMode=mixed
+# 管理器自己等各号 dario 排空最多 95s,这里留点余量。
+TimeoutStopSec=100
+LimitNOFILE=65535
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/caio
+
+[Install]
+WantedBy=multi-user.target

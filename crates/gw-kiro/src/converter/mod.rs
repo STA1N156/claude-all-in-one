@@ -1,0 +1,627 @@
+//! Anthropic → Kiro 协议转换器(入口 + 共享类型/常量)。
+//!
+//! 🔵 搬运自旧 `src/anthropic/converter.rs`(3214 行单文件),按职责拆分为子模块:
+//! - [`model_map`] 模型映射  - [`session`] conversationId 派生  - [`content`] 内容抽取
+//! - [`tools`] 工具转换  - [`pairing`] tool 配对清理  - [`history`] 历史构建
+//! - [`cache_point`] cachePoint 实验开关(dormant)
+//! 本文件保留入口 `convert_request`、`ConversionResult/Error` 与跨模块共享常量。
+#![allow(clippy::doc_lazy_continuation)] // 迁移注释原样保留,不重排
+
+use std::collections::HashMap;
+
+use crate::anthropic_types::{ContentBlock, MessagesRequest};
+use crate::kiro_types::conversation::{
+    CachePoint, ClientCacheConfig, ConversationState, CurrentMessage, Message,
+    UserInputMessage, UserInputMessageContext,
+};
+
+mod cache_point;
+mod classifier_prompt;
+mod clients;
+mod content;
+mod document_name;
+mod extra_models;
+mod history;
+pub(crate) mod media_limits;
+mod model_map;
+/// 权威表本体只给**测试**遍历用(逐条核对 `effort_schema` / 夹取 / 文本标签字节)。
+/// 生产代码一律走上面 `pub use` 的函数,不直接摸表 —— 保持「同一个东西只有一条访问路径」。
+#[cfg(test)]
+pub(crate) use model_map::KIRO_MODELS;
+mod normalize;
+mod pairing;
+mod session;
+mod shed;
+mod tool_id;
+mod tools;
+
+// 重导出子模块项,使本文件(及测试)无需逐一限定路径即可调用。
+pub use model_map::{
+    advertised_models, clamp_effort_for_model, denies_free, effort_drift, effort_schema_for,
+    get_context_window_size, map_model, requires_structured_effort, resolve_base,
+    routes_to_anthropic, signature_id_for, tokenizer_for_kiro_model, AdvertisedModel,
+    EffortDrift, EffortSchema, SignatureId,
+};
+pub use clients::ClientKind;
+pub use extra_models::{active_extra_ids, set_extra_models, validate_extra_models, ApplyOutcome};
+pub use media_limits::{enforce_media_limits, MediaLimitReport};
+pub use shed::{shed_history_media, MediaShed};
+/// 实验开关热应用入口(供 [`crate::KiroProvider::apply_hot_settings`] 调用)。
+pub(crate) use cache_point::set_experimental_flags;
+/// thinking 签名发射开关(供 [`crate::chat`] 在收尾 thinking 块时判定是否附 signature)。
+pub(crate) use cache_point::thinking_signature_enabled;
+/// 全局上游端点开关(供 `crate::endpoint::resolve` 判定;账号写了 `extra.kiro_endpoint` 时以账号为准)。
+pub(crate) use cache_point::q_endpoint_enabled;
+/// 历史 thinking 保留轮数热应用入口(供 [`crate::KiroProvider::apply_hot_settings`] 调用)。
+pub(crate) use history::set_history_thinking_turns;
+use cache_point::*;
+use content::*;
+use document_name::dedup_document_names;
+use history::*;
+use pairing::*;
+use session::*;
+use tool_id::rewrite_duplicate_tool_use_ids;
+use tools::*;
+// normalize 的项在本文件以显式路径调用;glob 仅给测试模块用(避免非测试构建 unused 警告)。
+#[cfg(test)]
+use normalize::*;
+
+/// 空内容占位符。Kiro 要求 message.content 非空(否则 400 Improperly formed request)。
+/// 纯 tool_use 回合或上游空响应残留时,用单空格兜底保持 schema 合法。
+///
+/// ⚠️ 只能用于 **assistant** 消息!2026-08-19 线上实测(V20-V24 变体回放):
+/// user 消息 content 为纯空白(" "/"\\n")时 Kiro 确定性 400 REQUEST_BODY_INVALID,
+/// assistant 纯空白则放行。user 侧请用 [`EMPTY_USER_CONTENT_PLACEHOLDER`]。
+pub(crate) const EMPTY_CONTENT_PLACEHOLDER: &str = " ";
+
+/// user 消息的空内容占位符。Kiro 拒纯空白 user content(见上),但接受任意非空白文本;
+/// 用可见的「(空)」而非隐藏字符,日志/上游两侧都能一眼认出这是兜底痕迹。
+pub(crate) const EMPTY_USER_CONTENT_PLACEHOLDER: &str = "(空)";
+
+/// 媒体附件(image/document)无文本时的占位引导语(实测纯 PDF/纯图无文本 → Kiro 400)。
+pub(crate) const MEDIA_ONLY_PLACEHOLDER: &str = "Please analyze the attached file.";
+
+/// 转换结果
+#[derive(Debug)]
+pub struct ConversionResult {
+    /// 转换后的 Kiro 请求
+    pub conversation_state: ConversationState,
+    /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
+    pub tool_name_map: HashMap<String, String>,
+    /// 工具防御性修复字段表：发往上游的工具短名 → 该工具 input_schema 中 type 为
+    /// array/object 的顶层字段集合。供流式收尾解包被模型双重编码成字符串的参数
+    /// （如 AskUserQuestion.questions）。无 array/object 字段的工具不入表。
+    pub tool_repair_fields: HashMap<String, std::collections::HashSet<String>>,
+    /// 认出来的客户端(见 [`clients`])。
+    pub client: ClientKind,
+}
+
+/// 转换错误
+#[derive(Debug)]
+pub enum ConversionError {
+    UnsupportedModel(String),
+    EmptyMessages,
+}
+
+impl std::fmt::Display for ConversionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
+            ConversionError::EmptyMessages => write!(f, "消息列表为空"),
+        }
+    }
+}
+
+impl std::error::Error for ConversionError {}
+
+/// conversationId 派生的 system 锚点字节数。
+///
+/// system 折叠块从前到后混了三类内容:① agent 角色(开头)② 机器/用户特征(CLAUDE.md
+/// 路径,char ~2500)③ 滚动参数(`Today's date`,char ~57400)。取前 8192 字节恰覆盖 ①②
+/// (区分 agent 与用户)、又远在 ③ 之前(不被日期误拆)。实测 1024 会误并不同用户、全文会
+/// 跨午夜误拆健康会话;4096–8192 是 false-merge/false-split 同时最低的区间。
+const SYSTEM_ANCHOR_PREFIX_LEN: usize = 8192;
+
+/// 从 Anthropic 请求派生稳定 conversationId(v55:metadata.user_id 优先,否则
+/// system 锚点 + 前2条 user 哈希)。**单一实现**:`convert_request` 与 worker 会话亲和
+/// 都走它,保证 router/cache_sim/账号亲和三处身份链同源(审查 #131③)。
+///
+/// `messages` 应为 prefill 预处理后的切片(末尾 user);body 级入口见 [`affinity_key_from_body`]。
+/// `scope` = 账号作用域盐(见 [`derive_conversation_id_from_messages`] 的长注释)。
+/// **调度亲和键传空串**,发包时传 `account_id`。
+pub fn derive_conversation_id(
+    req: &MessagesRequest,
+    messages: &[crate::anthropic_types::Message],
+    scope: &str,
+) -> String {
+    let from_metadata = req
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_ref())
+        .and_then(|user_id| extract_session_id(user_id));
+    match from_metadata {
+        // ⚠️ **metadata 那条路也必须加盐。** 那时 ID 是客户端 session id 的**原文**,
+        // 不加盐等于把「同一个客户端会话」这件事在多个 AWS 账号之间明文关联起来 ——
+        // 这是三条路里最强的池化特征。加盐后仍然「同号恒等」,亲和与缓存都不受影响
+        // (调度键走的是 scope 为空的那条,见 `affinity_key_from_body`)。
+        Some(sid) if !scope.is_empty() => scope_session_id(&sid, scope),
+        Some(sid) => sid,
+        None => {
+            let sys_full = normalized_client_system(req);
+            let sys_anchor = safe_prefix(&sys_full, SYSTEM_ANCHOR_PREFIX_LEN);
+            derive_conversation_id_from_messages(messages, sys_anchor, scope)
+        }
+    }
+}
+
+/// 把客户端给的 session id 按账号重新派生成 UUID 形态。
+///
+/// 输出必须仍然长得像 Kiro 客户端会发的值(UUID),所以走同一套「sha256 前 16 字节排成
+/// UUID」的成型逻辑,而不是简单拼前缀 —— 拼前缀会让 ID 变成一个上游从没见过的形状。
+fn scope_session_id(session_id: &str, scope: &str) -> String {
+    session::uuid_from_parts(&[b"sid:", session_id.as_bytes(), b"acct:", scope.as_bytes()])
+}
+
+/// 会话亲和键入口:从原始 Anthropic body 派生 conversationId(供 worker 选号亲和)。
+///
+/// 与 `convert_request` 同口径:解析失败 / 模型不支持 / 空消息 → `None`(调用方退化为
+/// 无亲和的 LRU 选号)。复刻 prefill 截断,使派生出的 key 与真正发包时的 conversationId 一致。
+pub fn affinity_key_from_body(body: &serde_json::Value) -> Option<String> {
+    let req: MessagesRequest = serde_json::from_value(body.clone()).ok()?;
+    if req.messages.is_empty() {
+        return None;
+    }
+    let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
+        let last_user_idx = req.messages.iter().rposition(|m| m.role == "user")?;
+        &req.messages[..=last_user_idx]
+    } else {
+        &req.messages
+    };
+    // ⚠️ **亲和键不加盐**:它是调度层的 key(选号、缓存模拟、钉扎),必须只依赖请求内容 ——
+    // worker 是**先算这个键、再选号**的,这里拿不到也不该拿到账号。
+    // 账号盐只作用于真正发给上游的 conversationId(见 `convert_request` 的 `scope`)。
+    Some(derive_conversation_id(&req, messages, ""))
+}
+
+/// **调度钉号键**(会话 + 线程),只给 worker 调度器用,不进 wire、不影响计费与 cache_sim。
+///
+/// 为什么不直接用 [`affinity_key_from_body`]:带 `metadata.user_id` 会话号时,它就是会话 UUID
+/// —— Claude Code 同一会话的主对话与各个子代理共用一个会话号,却各有自己的 system 与首条
+/// 用户消息(前缀不同、上游缓存互不相通)。钉在同一个号上只会互相挤占并发位、制造溢出换号。
+/// 2026-09-30 采集:平均每会话 3.6 个线程,68.5% 的请求来自多线程会话。
+///
+/// 形态:有会话号 → `s/{会话UUID}/{指纹}`;无会话号 → `t/{指纹}`。
+/// 指纹 = system 前 [`SYSTEM_ANCHOR_PREFIX_LEN`] 字节(逐块剥 billing 指纹行后 `\n` 拼接,
+/// 与 `normalized_client_system` 同口径)+ **首条 user 消息的纯文本**(只取 text,忽略图片/
+/// tool_result 与 `cache_control`)。首条消息在历史里不变,所以指纹从第 1 轮起跨轮稳定;
+/// 旧的无会话号派生哈希前两条 user 的整段 JSON,第 1→2 轮必变,且随 cache_control 位置漂移。
+///
+/// 首条消息带图片/文档时,指纹再并入它们的轻量摘要(见 [`content_media_digest`]):
+/// 否则「同一句指令 + 每次不同的文档」这类单轮批处理会被当成**一条**线程 —— 调度器以为
+/// 它们共享缓存,全挤到同一个号上排队,实际每次内容都不同、一次也命中不了(2026-10-03 实测)。
+/// 纯文本首条消息的指纹与之前逐字节相同(上线不打散在途线程)。
+///
+/// 直接读 `&Value` 字段,**不 clone、不整体反序列化**(请求体可达数 MB,含 base64 图片)。
+/// 消息为空返回 `None`(调用方退化为无钉号选号)。
+pub fn thread_key_from_body(body: &serde_json::Value) -> Option<String> {
+    let messages = body.get("messages")?.as_array()?;
+    let first_user = messages
+        .iter()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))?;
+    let first_text = content_plain_text(first_user.get("content"));
+    let media = content_media_digest(first_user.get("content"));
+    let system = system_anchor_text(body.get("system"));
+    let anchor = session::safe_prefix(&system, SYSTEM_ANCHOR_PREFIX_LEN);
+    let mut parts: Vec<&[u8]> = vec![
+        b"thread-sys:",
+        anchor.as_bytes(),
+        b"thread-u1:",
+        first_text.as_bytes(),
+    ];
+    if !media.is_empty() {
+        parts.push(b"thread-m1:");
+        parts.push(media.as_bytes());
+    }
+    let fp = session::uuid_from_parts(&parts);
+    let sid = body
+        .get("metadata")
+        .and_then(|m| m.get("user_id"))
+        .and_then(|u| u.as_str())
+        .and_then(session::extract_session_id);
+    Some(match sid {
+        Some(sid) => format!("s/{sid}/{fp}"),
+        None => format!("t/{fp}"),
+    })
+}
+
+/// system 的归一化文本(`&Value` 版),与 `session::normalized_client_system` 同口径:
+/// 字符串 → 一块;数组 → 逐块取 `text`,各自剥 billing 指纹行后以 `\n` 拼接。
+fn system_anchor_text(system: Option<&serde_json::Value>) -> String {
+    match system {
+        Some(serde_json::Value::String(s)) => normalize::strip_rolling_fingerprints(s),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .map(normalize::strip_rolling_fingerprints)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// 一条消息 content 里图片/文档块的轻量摘要:每块取「类型 + 来源类型 + 媒体类型 + 数据长度 +
+/// 首尾各 32 个字符」。只读切片,不对整段 base64 做哈希(单图可达数 MB,每请求都要算一次)。
+/// 没有这类块返回空串。
+fn content_media_digest(content: Option<&serde_json::Value>) -> String {
+    const EDGE: usize = 32;
+    let Some(serde_json::Value::Array(blocks)) = content else { return String::new() };
+    let mut out = String::new();
+    for b in blocks {
+        let kind = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if kind != "image" && kind != "document" {
+            continue;
+        }
+        let src = b.get("source");
+        let field = |k: &str| src.and_then(|s| s.get(k)).and_then(|v| v.as_str()).unwrap_or("");
+        let payload = ["data", "url", "file_id"].iter().map(|k| field(k)).find(|v| !v.is_empty()).unwrap_or("");
+        let head: String = payload.chars().take(EDGE).collect();
+        let tail: String = {
+            let mut t: Vec<char> = payload.chars().rev().take(EDGE).collect();
+            t.reverse();
+            t.into_iter().collect()
+        };
+        out.push_str(&format!(
+            "{kind}|{}|{}|{}|{head}|{tail};",
+            field("type"),
+            field("media_type"),
+            payload.len()
+        ));
+    }
+    out
+}
+
+/// 一条消息 content 的纯文本:字符串原样;数组只拼 `type == "text"` 块的 text。
+fn content_plain_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// 转换结果最终要发成哪种报文。conversationState 两种协议共用,唯一的差别是旧协议的
+/// 正文思考标签(`KIRO_LEGACY_WIRE` / `KIRO_LEGACY_THINKING_TAGS` 时注入):
+/// `/v1/responses`(Kiro IDE 1.4.121)的思考强度只走结构化 `reasoning` 字段,真客户端正文里没有标签。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConvertWire {
+    /// GenerateAssistantResponse(现状)。
+    #[default]
+    Kiro,
+    /// `/v1/responses`(账号 `extra.kiro_endpoint=responses`)。
+    Responses,
+}
+
+/// 将 Anthropic 请求转换为 Kiro 请求(旧协议形态;等同 `convert_request_for(.., ConvertWire::Kiro)`)。
+pub fn convert_request(
+    req: &MessagesRequest,
+    // 账号作用域盐(通常是 `account_id`)。空串 = 不加盐(仅测试/亲和键口径)。
+    // 见 `session::derive_conversation_id_from_messages`:换号必须换上游 ID,否则同一个
+    // conversationId 会横跨多个 AWS 账号,那是账号池最强的特征之一。
+    scope: &str,
+) -> Result<ConversionResult, ConversionError> {
+    convert_request_for(req, scope, ConvertWire::Kiro)
+}
+
+/// [`convert_request`] 的显式报文形态版本:按账号选协议的调用方(chat)用它。
+pub fn convert_request_for(
+    req: &MessagesRequest,
+    scope: &str,
+    wire: ConvertWire,
+) -> Result<ConversionResult, ConversionError> {
+    // 1. 映射模型
+    let model_id = map_model(&req.model)
+        .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
+
+    // 2. 检查消息列表
+    if req.messages.is_empty() {
+        return Err(ConversionError::EmptyMessages);
+    }
+
+    // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
+    // Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
+    let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
+        tracing::info!("检测到末尾 assistant 消息（prefill），静默丢弃");
+        let last_user_idx = req
+            .messages
+            .iter()
+            .rposition(|m| m.role == "user")
+            .ok_or(ConversionError::EmptyMessages)?;
+        &req.messages[..=last_user_idx]
+    } else {
+        &req.messages
+    };
+
+    // 3. 生成会话 ID 和代理 ID。conversationId 派生逻辑抽到 [`derive_conversation_id`]
+    //    (worker 会话亲和也复用它,保证 router/sim/亲和三处身份链同源)。
+    let conversation_id = derive_conversation_id(req, messages, scope);
+    // 【2026-06-15 修正·真实缓存全 miss 根因再定位】
+    // 2026-06-13 曾删除 agentContinuationId,理由"kiro.rs/static_flow 都不发、发了破缓存"。
+    // 复核证伪:kiro.rs **生产一直在发**稳定的 agentContinuationId(converter.rs:670,实测注释
+    // 稳定值 → metering 降 ~36%),且 caio 自身 2026-05-24 命中 A/B 基线**也含**此字段(6-13 才删)。
+    // 删除后线上实测 caio 真实命中 **0%**、credit **+49% vs kiro.rs**(后者同上游 ~43% 命中)。
+    // 故恢复**稳定**派生,经 `agent_continuation_enabled()` 开关上 wire(默认关,生产做可逆 A/B):
+    // 稳定 conversationId(本 crate 已保证)+ 稳定 agentContinuationId = kiro.rs proven 配置。
+    // 实际附挂在 `with_agent_continuation_metadata`(纯函数,便于直接测两个分支)。
+
+    // 3.1 跨轮重复 tool_use_id 重写(🟢 static_flow)。客户端反复 auto-compact 后,同一
+    // tool_use_id 可能在两个各自已完成的 assistant 轮里各出现一次,直发会让 Kiro 400。
+    // **必须在 conversationId 派生之后**:身份哈希走原始 messages,与 worker 的
+    // `affinity_key_from_body`(同样基于原始 body)同源;改写只作用于发往 Kiro 的 wire 报文。
+    // 无重复时返回 None,继续用原 borrowed slice(零拷贝)。畸形输入不报错,交 pairing 兜底。
+    let deduped = rewrite_duplicate_tool_use_ids(messages);
+    let messages: &[_] = deduped.as_deref().unwrap_or(messages);
+
+    // 3.2 文档名去重 + 净化:Bedrock 要求 document name 全局唯一且限定字符集,否则 400
+    // INVALID_DOCUMENT_NAME(duplicate document names)。多份无名附件都兜成 "document" 是
+    // 最常见触发。零拷贝快路径,时序与 tool_id 一致(conversationId 派生之后,不扰动身份/亲和/缓存)。
+    let doc_deduped = dedup_document_names(messages);
+    let messages: &[_] = doc_deduped.as_deref().unwrap_or(messages);
+
+    // 3.5 按客户端翻译(责任链,见 `clients`):认出是哪家客户端,按它的习惯整理消息
+    // (role=system / developer 分流、占位清理等);认不出来走兜底 = 原有整套处理。
+    // **必须在 conversationId 派生之后**:身份哈希走翻译前的原始 messages,
+    // 翻译产物不参与身份哈希,故 conversationId 跨轮稳定、零迁移。
+    // 不需要改消息时 messages 为 None,继续用原 borrowed slice(零拷贝)。
+    let translation = clients::translate(req, messages);
+    let client = translation.kind;
+    let messages: &[_] = translation.messages.as_deref().unwrap_or(messages);
+    let promoted_system: &[String] = &translation.promoted_system;
+
+    // 4. 确定触发类型
+    let chat_trigger_type = determine_chat_trigger_type(req);
+
+    // 5. 锚定当前轮范围:尾部连续 user 消息整体作为 current turn(🟢 static_flow)。
+    // 旧逻辑只取最后一条,会把代理拆分的同一轮前半截误归 history 毒化缓存前缀。
+    // messages 经 prefill 预处理末尾必为 user,current_user_message_range 必返 Some。
+    let current_range = current_user_message_range(messages)
+        .ok_or(ConversionError::EmptyMessages)?;
+    let current_messages = &messages[current_range.clone()];
+    let history_messages = &messages[..current_range.start];
+
+    // 合并当前轮的多条连续 user 消息(text/tool_result 分条发等)为单一内容。
+    let (text_content, images, documents, tool_results) =
+        merge_current_message_content(current_messages)?;
+
+    // 6. 转换工具定义（超长名称自动缩短并记录映射；同时按 schema 收集需修复的 array/object 字段）
+    let mut tool_name_map = HashMap::new();
+    let mut tool_repair_fields: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    let mut tools = convert_tools(&req.tools, &mut tool_name_map, &mut tool_repair_fields);
+
+    // 7. 构建历史消息（当前轮之前的所有消息;需要先构建,以便收集历史中使用的工具）
+    // promoted_system: 块1a 从 messages 数组提升上来的稳定 system 文本,折叠进 history[0]。
+    let mut history = build_history(req, history_messages, &model_id, promoted_system, &mut tool_name_map, wire)?;
+
+    // 8. 验证并过滤 tool_use/tool_result 配对
+    // 移除孤立的 tool_result（没有对应的 tool_use）
+    // 同时返回孤立的 tool_use_id 集合，用于后续清理
+    let (validated_tool_results, orphaned_tool_use_ids) =
+        validate_tool_pairing(&history, &tool_results);
+
+    // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
+    remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
+
+    // 9.5 从历史中移除孤立的 tool_result（有结果但找不到对应的 tool_use）
+    // 客户端（如 Claude Code）反复 auto-compact 长对话时，可能压掉发起 tool_use 的
+    // assistant 消息却保留其 tool_result，残留成埋在 history 中段的孤儿。
+    // 上游 Kiro 对这种 result-without-use 同样返回 400 Improperly formed request，
+    // 这里反向清理：删掉 history 里任何 tool_use_id 无对应 tool_use 的 tool_result。
+    remove_orphaned_tool_results(&mut history);
+
+    // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
+    // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
+    // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
+    let history_tool_names = collect_history_tool_names(&history);
+    let existing_tool_names: std::collections::HashSet<_> = tools
+        .iter()
+        .map(|t| t.tool_specification.name.to_lowercase())
+        .collect();
+
+    for tool_name in history_tool_names {
+        if !existing_tool_names.contains(&tool_name.to_lowercase()) {
+            tools.push(create_placeholder_tool(&tool_name));
+        }
+    }
+
+    // 10.5 多模态 schema 兼容(🟢 static_flow):请求(当前轮或历史)含图片时,Kiro 会拒绝带
+    // anyOf/oneOf/$defs 等复杂关键字的工具 schema(400 Improperly formed request)。把这类 schema
+    // 整体降级为宽松 object schema;无图片则原样不动。在工具放置前做,current/history 放置都覆盖。
+    // 用**转换后**的图判定(caio 丢弃 url/file 图、只留 base64 上 wire):current=已转 `images`,
+    // history=已转 KiroImage。避免按原始报文误判(带 url 图但 wire 无图却误降级,审查 Skeptic#2)。
+    let has_images = !images.is_empty()
+        || history
+            .iter()
+            .any(|m| matches!(m, Message::User(u) if !u.user_input_message.images.is_empty()));
+    apply_multimodal_tool_schema_compatibility(&mut tools, has_images);
+
+    // 11. 构建 UserInputMessageContext
+    // 记录是否有工具结果（validated_tool_results 随后会被移动进 context，这里先存一份布尔量
+    // 供后续当前消息的空内容兜底判断使用）。
+    let has_tool_results = !validated_tool_results.is_empty();
+    // 工具放置策略：
+    // - 默认：放 currentMessage（每轮全价重发，无法缓存）
+    // - 实验开关开启且有历史用户消息：放 history[0] 前缀，进可缓存区
+    let place_in_history = tools_in_prefix_enabled()
+        && !tools.is_empty()
+        && matches!(history.first(), Some(Message::User(_)));
+
+    let mut context = UserInputMessageContext::new();
+    if place_in_history {
+        if let Some(Message::User(h)) = history.first_mut() {
+            h.user_input_message.user_input_message_context.tools = std::mem::take(&mut tools);
+            tracing::info!(
+                "实验[tools_in_prefix]: {} 个工具已放入 history[0] 前缀（尝试命中缓存）",
+                h.user_input_message.user_input_message_context.tools.len()
+            );
+        }
+    } else if !tools.is_empty() {
+        context = context.with_tools(tools);
+    }
+    if !validated_tool_results.is_empty() {
+        context = context.with_tool_results(validated_tool_results);
+    }
+
+    // 12. 构建当前消息（content 兜底）
+    // Kiro 的 content 非空约束分两种情形：
+    //   - 带 image/document 但无文本 → **必须**补非空 content（实测纯 PDF/纯图无文本 → 400，
+    //     见 MEDIA_ONLY_PLACEHOLDER）。补一句引导语，让模型明确分析附件。
+    //   - text、tool_results、images、documents 全空 → 补 user 专用占位符（纯空回合，
+    //     客户端异常；纯空白 user content 会被 Kiro 拒，见 EMPTY_USER_CONTENT_PLACEHOLDER）。
+    // 归一:纯空白文本视同无文本。否则「text=" " + 有效 tool_result」会把空白原样
+    // 放进当前轮 content —— 纯空白 user content 被 Kiro 确定性 400(2026-08-19 实测)。
+    let text_content = if text_content.trim().is_empty() {
+        String::new()
+    } else {
+        text_content
+    };
+    //   - 无文本但有 tool_results（且无媒体）→ 正常工具结果回合，Kiro 接受空文本，不补（否则污染）。
+    let content = if !text_content.is_empty() {
+        text_content
+    } else if !images.is_empty() || !documents.is_empty() {
+        tracing::warn!(
+            "当前 user 消息带媒体（image/document）但无文本，已补引导语占位以避免 Kiro 400"
+        );
+        MEDIA_ONLY_PLACEHOLDER.to_string()
+    } else if !has_tool_results {
+        tracing::warn!(
+            "当前 user 消息为空（无 text/tool_result/image/document），已用占位符兜底以避免 Kiro 400"
+        );
+        EMPTY_USER_CONTENT_PLACEHOLDER.to_string()
+    } else {
+        // 仅有 tool_results（无媒体、无文本）：正常工具结果回合，保留空文本。
+        text_content
+    };
+
+    // 12.1 安全分类器第二段「正文写 <thinking>」指令的上游兼容改写(按模型表,目前 5.5 系,逐字匹配
+    // Claude Code 原句;不命中零改动)。上游把它判成 REASONING_EXTRACTION 拒答,见
+    // classifier_prompt 模块注释。在 thinking 前缀注入之前做,只动当前轮文本。
+    let content = classifier_prompt::rewrite_visible_thinking_directive(&req.model, content);
+
+    // 块2b:thinking 前缀注入**当前轮** content(不进 system/history,避免毒化缓存前缀)。
+    // 在兜底之后注入:即便当前轮是纯 tool_result/媒体占位,带 thinking 时也应让上游开思考。
+    let mut content = content;
+    // [EXP] 若已把 thinking 注入 history[0],当前轮不再重复注入
+    if std::env::var("KIRO_THINKING_IN_HISTORY0").is_err() {
+        apply_thinking_prefix_to_current_turn(req, &mut content, wire);
+    }
+
+    let mut user_input = UserInputMessage::new(content, &model_id)
+        .with_context(context)
+        .with_origin("AI_EDITOR");
+
+    if !images.is_empty() {
+        user_input = user_input.with_images(images);
+    }
+
+    if !documents.is_empty() {
+        user_input = user_input.with_documents(documents);
+    }
+
+    // 实验：翻译 cache_control → cachePoint。env flag 控制，默认关闭。
+    // 当前轮可能含多条连续 user 消息,任一条带 cache_control 即视为命中。
+    let want_cache_point = cache_point_enabled()
+        && current_messages
+            .iter()
+            .any(|m| anthropic_message_has_cache_control(&m.content));
+    if want_cache_point && cache_point_placement() == "current" {
+        user_input.cache_point = Some(CachePoint::with_type(cache_point_type()));
+        if cache_point_with_config() {
+            user_input.client_cache_config = Some(ClientCacheConfig::default());
+        }
+        tracing::info!(
+            "实验[cache_point]: currentMessage 打 cachePoint type={} config={}",
+            cache_point_type(),
+            cache_point_with_config()
+        );
+    }
+
+    // 12.5 上游逐项媒体硬限制预检(单文档 4.5MB / 每条 5 个文档 / 单图 5MB / 边长 8000px,
+    // 2026-09-29 实测):超限附件就地换成模型可读的说明,不让一个超限附件把整轮打成 400
+    // (客户端每轮重发历史,超限附件一直在,会话此后每轮 400)。无超限项时零改动,不扰动缓存前缀。
+    enforce_media_limits(&mut user_input, &mut history);
+
+    let current_message = CurrentMessage::new(user_input);
+
+    // 实验变体：把 cachePoint 打在 history 最后一条 user 上（前缀缓存语义）。
+    if want_cache_point && cache_point_placement() == "history" {
+        if let Some(Message::User(h)) = history
+            .iter_mut()
+            .rev()
+            .find(|m| matches!(m, Message::User(_)))
+        {
+            h.user_input_message.cache_point = Some(CachePoint::with_type(cache_point_type()));
+            if cache_point_with_config() {
+                h.user_input_message.client_cache_config = Some(ClientCacheConfig::default());
+            }
+            tracing::info!(
+                "实验[cache_point]: history 末尾 user 打 cachePoint type={} config={}",
+                cache_point_type(),
+                cache_point_with_config()
+            );
+        }
+    }
+
+    // 13. 构建 ConversationState。chat_trigger_type=MANUAL 恒发;agentContinuationId + agentTaskType
+    // 仅在开关启用时上 wire(默认关,见上方根因注释 + `agent_continuation_enabled`)。
+    let conversation_state = with_agent_continuation_metadata(
+        ConversationState::new(conversation_id)
+            .with_chat_trigger_type(chat_trigger_type)
+            .with_current_message(current_message)
+            .with_history(history),
+        agent_continuation_enabled(),
+    );
+
+    if !tool_name_map.is_empty() {
+        tracing::info!(
+            "工具名称映射: {} 个超长名称已缩短",
+            tool_name_map.len()
+        );
+    }
+
+    Ok(ConversionResult {
+        conversation_state,
+        tool_name_map,
+        tool_repair_fields,
+        client,
+    })
+}
+
+/// 按开关把**稳定** agentContinuationId(从 `state.conversation_id` 派生,与 conversationId 同源)
+/// + agentTaskType="vibe" 附到 conversationState —— 复刻 kiro.rs proven 配置(见根因注释)。
+///
+/// **纯函数**(开关值由调用方传入,便于直接测两个分支,不依赖进程级实验全局):
+/// - `enabled=false`(默认):原样返回,两字段保持 None → 序列化时 **完全省略**(零 wire 变化);
+/// - `enabled=true`:附 agentContinuationId(稳定)+ agentTaskType="vibe"。
+fn with_agent_continuation_metadata(state: ConversationState, enabled: bool) -> ConversationState {
+    if !enabled {
+        return state;
+    }
+    let acid = derive_agent_continuation_id(&state.conversation_id);
+    state
+        .with_agent_continuation_id(acid)
+        .with_agent_task_type("vibe")
+}
+
+/// 确定聊天触发类型
+/// "AUTO" 模式可能会导致 400 Bad Request 错误
+fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
+    "MANUAL".to_string()
+}
+
+
+#[cfg(test)]
+mod tests;

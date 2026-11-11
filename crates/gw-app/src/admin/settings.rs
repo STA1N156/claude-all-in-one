@@ -1,0 +1,1334 @@
+//! admin 系统设置端点 —— 热调参数面板的后端。
+//!
+//! 设置模型:`system.yaml`([`SystemConfig`])是不可变基线(改它需重启),DB `settings`
+//! 表存**字段级 overlay**([`SystemSettings`],仅非 None 字段覆盖)。worker 30s 轮询 DB
+//! 后热应用,无需重启。
+//!
+//! - `GET /settings`:返回**有效全量**(YAML 基线叠 DB overlay,每字段都有值),前端据此
+//!   渲染当前生效值。
+//! - `PUT /settings`:吃**部分** patch,`null` 字段 = 删该 overlay 回 YAML 默认、非 null =
+//!   存 overlay。返回叠加后的新有效全量。
+//!
+//! 进程拓扑(端口/每 worker 源 IP)**不在此**(留 instances.yaml,需重启)。
+
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::{Json, Router};
+use gw_core::config::{SystemConfig, SystemSettings};
+
+use super::{internal_error, AdminState};
+
+pub fn router() -> Router<AdminState> {
+    Router::new().route("/settings", get(get_settings).put(put_settings))
+}
+
+/// 4xx 错误响应(请求体问题)。
+fn api_error(status: StatusCode, msg: &str) -> axum::response::Response {
+    (status, Json(serde_json::json!({"type":"error","error":{"message": msg}}))).into_response()
+}
+
+/// 由 DB overlay JSON 解析出 [`SystemSettings`](解析失败/无行 → 默认空 overlay)。
+pub(super) fn read_overlay(st: &AdminState) -> anyhow::Result<SystemSettings> {
+    match st.store.get_settings()? {
+        Some(j) => Ok(serde_json::from_str(&j).unwrap_or_default()),
+        None => Ok(SystemSettings::default()),
+    }
+}
+
+/// 把 overlay 叠到 YAML 基线得"有效"配置,再回灌成全量 [`SystemSettings`](含 default_proxy)。
+fn effective(st: &AdminState, overlay: &SystemSettings) -> SystemSettings {
+    let mut cfg: SystemConfig = (*st.yaml_config).clone();
+    overlay.apply_to(&mut cfg);
+    let mut full = SystemSettings::from_effective(&cfg, overlay.default_proxy.clone());
+    // egress_pool 与 default_proxy 同属「不进 SystemConfig」的出口字段,from_effective 不含它,
+    // 这里从 overlay 原样回灌(供前端展示当前池)。
+    full.egress_pool = overlay.egress_pool.clone();
+    full
+}
+
+/// 同 [`respond`],额外挂一个 `workers` 字段(逐 worker 实然值)。
+///
+/// 单开一个函数而不是「先 respond 再把 body 拆出来改」:后者要走
+/// 序列化→解析→再序列化的往返,还要操心 Content-Length 与「body 不是 object 就 panic」
+/// 这类边角(对抗审查 Skeptic#8)。多传一个参数便宜得多。
+fn respond_with_workers(
+    settings: SystemSettings,
+    workers: Vec<serde_json::Value>,
+) -> axum::response::Response {
+    let mut v = redacted_value(&settings);
+    if let serde_json::Value::Object(map) = &mut v {
+        map.insert("workers".into(), serde_json::Value::Array(workers));
+    }
+    Json(v).into_response()
+}
+
+/// 把有效设置序列化为响应,并掩码 default_proxy 的密码段(防 user:pass@ 经接口泄漏,
+/// 审查 Architect#3)。真实值仍在库里,worker 用真实值。
+fn respond(settings: SystemSettings) -> axum::response::Response {
+    Json(redacted_value(&settings)).into_response()
+}
+
+/// 掩码后的 JSON 值(两个 respond 共用,免得掩码规则分叉)。
+fn redacted_value(settings: &SystemSettings) -> serde_json::Value {
+    let mut v = serde_json::to_value(settings).unwrap_or(serde_json::Value::Null);
+    if let Some(dp) = v.get("default_proxy").and_then(|d| d.as_str()) {
+        let masked = super::redact_proxy_url(dp);
+        v["default_proxy"] = serde_json::json!(masked);
+    }
+    // egress_pool 每条 URL 同样可含 user:pass@,逐条掩码密码段(真实值仍在库里)。
+    if let Some(arr) = v.get("egress_pool").and_then(|d| d.as_array()) {
+        let masked: Vec<serde_json::Value> = arr
+            .iter()
+            .map(|item| match item.as_str() {
+                Some(s) => serde_json::json!(super::redact_proxy_url(s)),
+                None => item.clone(),
+            })
+            .collect();
+        v["egress_pool"] = serde_json::Value::Array(masked);
+    }
+    v
+}
+
+/// `GET /settings` → 当前有效全量设置。
+/// 逐 worker 问「你此刻**真正在用**的热调值是什么」。
+///
+/// 为什么 GET /settings 要带上它:这个接口回的是「库里存的 + YAML 基线」算出来的**应然**值,
+/// 而 worker 用的是它自己 30s 轮询应用后的**实然**值。两者不一致正是「我保存了不生效」的
+/// 全部内容,而在此之前面板上只有应然值 —— 于是那个问题在面板上根本不可见。
+///
+/// 单个 worker 离线/超时不影响整体:该条标 `online:false`,其余照常回。
+async fn worker_settings(st: &AdminState) -> Vec<serde_json::Value> {
+    let fetches = st.workers.iter().map(|w| {
+        let http = st.http.clone();
+        async move {
+            // 打**轻量**端点而不是 /health:后者会跑全账号快照并对配额缓存陈旧的账号
+            // 触发上游 getUsageLimits —— 「打开设置页」不该变成「对付费账号打上游」。
+            //
+            // 超时靠 `st.http` 的全局 2s(见 `AdminState` 构造),各 worker 并发,
+            // 所以一个挂住的 worker 最多让本接口慢 2 秒,不会拖死设置页。
+            let url = format!("http://{}/settings-sync", w.listen);
+            let fetched = match http.get(&url).send().await {
+                // 状态码必须看:非 2xx 也可能带一个能解析成 JSON 的错误体,当成正常
+                // 回包会把坏掉的 worker 显示成健康(对抗审查 Skeptic#12)。
+                Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+                    Ok(v) => Fetched::Body(v),
+                    Err(_) => Fetched::NoData,
+                },
+                // **答得出话就说明进程活着**,只是这个路由/字段它没有(旧镜像 404)。
+                Ok(_) => Fetched::NoData,
+                Err(_) => Fetched::Unreachable,
+            };
+            worker_row(w.instance, &w.account_group, fetched)
+        }
+    });
+    futures::future::join_all(fetches).await
+}
+
+/// 一次抓取的三种结局。
+///
+/// 分成三态而不是 `Option`,是因为后两种指向**完全不同的运维动作**:
+/// 连不上 = 进程可能死了,该去看容器;连得上但没这个路由 = 进程活得好好的,是镜像旧。
+/// 把后者显示成「离线」会把人指向错误的方向 —— 2026-08-06 上线时实测撞到:
+/// `caio-worker-dario` 跑着旧镜像,`/settings-sync` 返回 404,一度被判成掉线。
+enum Fetched {
+    /// 连不上(拒绝连接 / 超时)。
+    Unreachable,
+    /// 答得出话,但拿不到可用的 settings(旧镜像 404、非 2xx、body 解析失败)。
+    NoData,
+    Body(serde_json::Value),
+}
+
+/// 把一次抓取结果映射成面板要的一行。**纯函数**,把扇出里唯一有判断的部分抽出来测 ——
+/// 这几个分支正是本功能最想抓的场景,不该只靠线上观察(对抗审查 Skeptic#7)。
+fn worker_row(instance: u32, group: &str, fetched: Fetched) -> serde_json::Value {
+    let mut o = serde_json::json!({
+        "instance": instance, "group": group, "online": false,
+        "settings": serde_json::Value::Null, "stale_image": false,
+    });
+    let body = match fetched {
+        Fetched::Unreachable => return o,
+        // ⚠️ 这条是本次改动**最想抓**的那个场景:worker 镜像旧到还没有这个端点/字段。
+        //
+        // 若把它和「正常」一样留成 null,前端拿到 null 会走「无差异」分支渲染成绿色
+        // 「一致」—— 可观测性在它唯一存在的理由上说谎(对抗审查 Skeptic#1)。
+        Fetched::NoData => {
+            o["online"] = true.into();
+            o["stale_image"] = true.into();
+            return o;
+        }
+        Fetched::Body(v) => v,
+    };
+    o["online"] = true.into();
+    match body.get("settings") {
+        Some(s) if !s.is_null() => o["settings"] = s.clone(),
+        _ => o["stale_image"] = true.into(),
+    }
+    o
+}
+
+async fn get_settings(State(st): State<AdminState>) -> axum::response::Response {
+    let overlay = match read_overlay(&st) {
+        Ok(o) => o,
+        Err(e) => return internal_error(e),
+    };
+    // 把逐 worker 的实然值挂在同一份响应里:面板在**改设置的那一页**就能核对,
+    // 不用切页、更不用 SSH 上去查库。
+    //
+    // `PUT` 走不带 workers 的 `respond`:刚写完库时 worker 还没轮询到,
+    // 回一份必然过时的实然值只会让人以为没生效。
+    respond_with_workers(effective(&st, &overlay), worker_settings(&st).await)
+}
+
+/// `PUT /settings` ← 部分 patch(null=删该 overlay 字段回 YAML 默认,非 null=存)。
+/// 返回叠加后的新有效全量。
+async fn put_settings(
+    State(st): State<AdminState>,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    let serde_json::Value::Object(patch) = body else {
+        return api_error(StatusCode::BAD_REQUEST, "请求体应为 JSON 对象");
+    };
+    // 本次 patch 的键集合:未知键拒绝只针对它们(见下方校验)。owned 拷贝,
+    // 不持有对 patch 的借用(下面要 move 它)。
+    let patch_keys: std::collections::HashSet<String> = patch.keys().cloned().collect();
+
+    // 现有 overlay(原始 JSON map)→ 合并 patch:null 删键、非 null 设键。
+    let mut overlay_map: serde_json::Map<String, serde_json::Value> = match st.store.get_settings() {
+        Ok(Some(j)) => serde_json::from_str(&j).unwrap_or_default(),
+        Ok(None) => serde_json::Map::new(),
+        Err(e) => return internal_error(e),
+    };
+    for (k, v) in patch {
+        if v.is_null() {
+            // null = 删该 overlay 字段回 YAML 默认。拼错保护对 null 同样生效
+            // (复审 [中]):只有「进入合并前 overlay 里已存在」的键允许 null 清理;
+            // 压根不存在的**未知**键(多是拼错,如 `max_failure`)必须照拒 ——
+            // 否则 null 会绕过下方的 unknown 校验。已知字段的 null(无残留时
+            // 是 no-op 重置)不受影响。
+            if !overlay_map.contains_key(&k) {
+                let probe = serde_json::from_value::<SystemSettings>(serde_json::json!({
+                    k.clone(): serde_json::Value::Null
+                }))
+                .unwrap_or_default();
+                if probe.unknown.contains_key(&k) {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        &format!("未知设置字段: {k}"),
+                    );
+                }
+            }
+            overlay_map.remove(&k);
+            continue;
+        }
+        // 报文环境标准化(gw_core::envnorm):写侧就按 worker 同一套规则校验,
+        // 否则存进去了、每个 worker 各自拒绝并沿用上一份,面板看不出没生效。
+        if k == "env_normalize_providers" {
+            let list: Option<Vec<String>> = v.as_array().and_then(|a| {
+                a.iter().map(|x| x.as_str().map(|s| s.trim().to_string())).collect()
+            });
+            let Some(mut list) = list else {
+                return api_error(StatusCode::BAD_REQUEST, "env_normalize_providers 须为字符串数组");
+            };
+            list.sort();
+            list.dedup();
+            if let Some(bad) = list.iter().find(|f| !gw_core::envnorm::KNOWN_FAMILIES.contains(&f.as_str())) {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("env_normalize_providers 含未知线路 {bad:?}(可选 {})", gw_core::envnorm::KNOWN_FAMILIES.join(" / ")),
+                );
+            }
+            overlay_map.insert(k, serde_json::json!(list));
+            continue;
+        }
+        if k == "env_normalize_timezone" || k == "env_normalize_locale" {
+            let ok = v.as_str().map(str::trim).filter(|s| {
+                if k == "env_normalize_timezone" { gw_core::envnorm::valid_timezone(s) } else { gw_core::envnorm::valid_locale(s) }
+            });
+            match ok {
+                Some(s) => {
+                    overlay_map.insert(k, serde_json::json!(s));
+                }
+                None => {
+                    let hint = if k == "env_normalize_timezone" { "UTC 或 Area/City,如 Asia/Singapore" } else { "形如 en-US" };
+                    return api_error(StatusCode::BAD_REQUEST, &format!("{k} 不合法({hint})"));
+                }
+            }
+            continue;
+        }
+        // 自动模式分类器:写侧按 worker 同一套规则校验 —— 存进去一个错字、每个 worker
+        // 各自拒绝并沿用上一份,面板却显示「已保存」,正是最难查的那种假象。
+        if k == "auto_mode_classifier" {
+            let Some(raw) = v.as_str() else {
+                return api_error(StatusCode::BAD_REQUEST, "auto_mode_classifier 须为字符串");
+            };
+            match gw_core::config::automode::parse_mode(raw) {
+                Ok(m) => {
+                    overlay_map.insert(k, serde_json::json!(gw_core::config::automode::mode_str(m)));
+                }
+                Err(e) => return api_error(StatusCode::BAD_REQUEST, &e),
+            }
+            continue;
+        }
+        if k == "auto_mode_classifier_model" {
+            match v.as_str().map(str::trim) {
+                // 空串 = 回基线默认。
+                Some("") => {
+                    overlay_map.remove(&k);
+                }
+                Some(m) => {
+                    overlay_map.insert(k, serde_json::json!(m));
+                }
+                None => {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        "auto_mode_classifier_model 须为字符串",
+                    )
+                }
+            }
+            continue;
+        }
+        // 批量任务拦截(`batch_guard_*`):写侧与 worker 读侧同一套规则
+        // (`gw_core::config::batch_guard::validate_setting`),存进去的一定是 worker 认的值。
+        if let Some(r) = gw_core::config::batch_guard::validate_setting(&k, &v) {
+            match r {
+                Ok(norm) => {
+                    overlay_map.insert(k, norm);
+                }
+                Err(e) => return api_error(StatusCode::BAD_REQUEST, &e),
+            }
+            continue;
+        }
+        // 拒答记忆(`refusal_guard_*`):同上,写侧与 worker 读侧同一套规则。
+        if let Some(r) = gw_core::config::refusal_guard::validate_setting(&k, &v) {
+            match r {
+                Ok(norm) => {
+                    overlay_map.insert(k, norm);
+                }
+                Err(e) => return api_error(StatusCode::BAD_REQUEST, &e),
+            }
+            continue;
+        }
+        // 号池熔断(`pool_breaker_*`):同上,写侧与 worker 读侧同一套规则。
+        if let Some(r) = gw_core::config::pool_breaker::validate_setting(&k, &v) {
+            match r {
+                Ok(norm) => {
+                    overlay_map.insert(k, norm);
+                }
+                Err(e) => return api_error(StatusCode::BAD_REQUEST, &e),
+            }
+            continue;
+        }
+        // dario 线翻译成 Claude Code 报文的开关:写侧与 worker 读侧同一套规则(gw_core::config::dario_cc)。
+        if let Some(r) = gw_core::config::dario_cc::validate_setting(&k, &v) {
+            match r {
+                Ok(norm) => {
+                    overlay_map.insert(k, norm);
+                }
+                Err(e) => return api_error(StatusCode::BAD_REQUEST, &e),
+            }
+            continue;
+        }
+        // cursor_tool_guard:内建工具护栏的策略句。空串=清除回内置默认。
+        //
+        // 长度在**写侧**就拦:worker 侧的 `set_tool_guard_policy` 也拦,但那是
+        // 「存进去了、每个 worker 各自拒绝并沿用上一份」——面板上看不出保存的值
+        // 从来没生效过。写侧拦掉才有即时反馈。上限与 gw-cursor 侧同源。
+        if k == "cursor_tool_guard" {
+            match v.as_str() {
+                Some(s) if s.trim().is_empty() => {
+                    overlay_map.remove(&k);
+                }
+                Some(s) => {
+                    const MAX_CHARS: usize = 2000;
+                    let n = s.trim().chars().count();
+                    if n > MAX_CHARS {
+                        return api_error(
+                            StatusCode::BAD_REQUEST,
+                            &format!("cursor_tool_guard 过长({n} 字符,上限 {MAX_CHARS})"),
+                        );
+                    }
+                    overlay_map.insert(k, serde_json::json!(s.trim()));
+                }
+                None => {
+                    return api_error(StatusCode::BAD_REQUEST, "cursor_tool_guard 须为字符串")
+                }
+            }
+            continue;
+        }
+        // cursor_tool_loop_nudge:cursor 工具回路中间轮提醒正文。规则同 cursor_tool_guard
+        // (空串=清除回内置默认;上限与 gw-cursor 侧 TOOL_LOOP_NUDGE_MAX_CHARS 同源)。
+        if k == "cursor_tool_loop_nudge" {
+            match v.as_str() {
+                Some(s) if s.trim().is_empty() => {
+                    overlay_map.remove(&k);
+                }
+                Some(s) => {
+                    const MAX_CHARS: usize = gw_core::config::CURSOR_TOOL_LOOP_NUDGE_MAX_CHARS;
+                    let n = s.trim().chars().count();
+                    if n > MAX_CHARS {
+                        return api_error(
+                            StatusCode::BAD_REQUEST,
+                            &format!("cursor_tool_loop_nudge 过长({n} 字符,上限 {MAX_CHARS})"),
+                        );
+                    }
+                    overlay_map.insert(k, serde_json::json!(s.trim()));
+                }
+                None => {
+                    return api_error(StatusCode::BAD_REQUEST, "cursor_tool_loop_nudge 须为字符串")
+                }
+            }
+            continue;
+        }
+        // default_proxy:空串=清除;非空=写入边界校验 + 归一(fail-closed,审查 Skeptic#2)。
+        if k == "default_proxy" {
+            match v.as_str() {
+                Some(s) if s.trim().is_empty() => {
+                    overlay_map.remove(&k);
+                }
+                Some(s) => match super::validate_proxy_url(s) {
+                    Ok(valid) => {
+                        overlay_map.insert(k, serde_json::json!(valid));
+                    }
+                    Err(msg) => return api_error(StatusCode::BAD_REQUEST, msg),
+                },
+                None => return api_error(StatusCode::BAD_REQUEST, "default_proxy 须为字符串"),
+            }
+            continue;
+        }
+        // egress_pool:出口代理池(数组)。空数组=清除;非空=逐条 validate_proxy_url(fail-closed,
+        // 同 default_proxy:拒绝含 *** 掩码的回传值,绝不把脱敏形态当真值存)。
+        if k == "egress_pool" {
+            match v.as_array() {
+                Some(arr) if arr.is_empty() => {
+                    overlay_map.remove(&k);
+                }
+                Some(arr) => {
+                    let mut validated = Vec::with_capacity(arr.len());
+                    for item in arr {
+                        let Some(s) = item.as_str() else {
+                            return api_error(StatusCode::BAD_REQUEST, "egress_pool 每项须为字符串");
+                        };
+                        match super::validate_proxy_url(s) {
+                            Ok(valid) => validated.push(serde_json::Value::String(valid)),
+                            Err(msg) => return api_error(StatusCode::BAD_REQUEST, msg),
+                        }
+                    }
+                    overlay_map.insert(k, serde_json::Value::Array(validated));
+                }
+                None => return api_error(StatusCode::BAD_REQUEST, "egress_pool 须为数组"),
+            }
+            continue;
+        }
+        // default_thinking_effort:必须命中上游档位全集。这个值会**原样进 wire**
+        // (`additionalModelRequestFields.effort`),脏值换来的是上游 400 —— 而且要等到下一次
+        // 真实请求才暴露,所以在写库前就挡住。空串=清除回 YAML 默认。
+        if k == "default_thinking_effort" {
+            match v.as_str() {
+                Some(s) if s.trim().is_empty() => {
+                    overlay_map.remove(&k);
+                }
+                Some(s) => match gw_kiro::anthropic_types::normalize_effort(Some(s)) {
+                    // 归一后存标准小写形态(上游只认小写),而不是原样存用户输入。
+                    (canonical, false) => {
+                        overlay_map.insert(k, serde_json::json!(canonical));
+                    }
+                    (_, true) => {
+                        return api_error(
+                            StatusCode::BAD_REQUEST,
+                            &format!(
+                                "default_thinking_effort 不是合法档位: {s};可选 {}",
+                                gw_kiro::anthropic_types::VALID_EFFORTS.join(" / ")
+                            ),
+                        )
+                    }
+                },
+                None => {
+                    return api_error(StatusCode::BAD_REQUEST, "default_thinking_effort 须为字符串")
+                }
+            }
+            continue;
+        }
+        // history_thinking_turns:历史 thinking 保留轮数(0=全丢/默认;N>0=保留倒数最近
+        // N 个 assistant 合并单元;负=全保留)。任意整数都合法,只拦非整数 —— 通用路径的
+        // SystemSettings 反序列化也能拦,但报错是 serde 原文,这里给一句人话(同上面几个
+        // 专用分支的风格)。⚠️ 该值变化会改变历史字节:在途会话下一轮缓存全量 miss 一次。
+        if k == "history_thinking_turns" {
+            match v.as_i64() {
+                Some(n) => {
+                    overlay_map.insert(k, serde_json::json!(n));
+                }
+                None => {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        "history_thinking_turns 须为整数(0=全部丢弃/默认;N>0=保留最近 N 段;负数=全部保留)",
+                    )
+                }
+            }
+            continue;
+        }
+        // scheduler_algorithm:选号算法只接受已知取值。读侧的 `#[serde(other)]` 兜底是给
+        // 「更新镜像写入、本镜像不认识」的回滚场景用的,控制面绝不能主动写进一个未知值
+        // (通用路径会把它解析成 Unknown 放行,面板显示与实际执行就分叉了)。
+        if k == "scheduler_algorithm" {
+            let ok = v.as_str().and_then(|s| {
+                gw_core::config::SchedulerAlgorithm::SELECTABLE
+                    .iter()
+                    .find(|a| a.as_str() == s.trim())
+            });
+            match ok {
+                Some(a) => {
+                    overlay_map.insert(k, serde_json::json!(a.as_str()));
+                }
+                None => {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        "scheduler_algorithm 须为 cost_index(最优控制调度器)或 affinity(亲和调度·旧版)",
+                    )
+                }
+            }
+            continue;
+        }
+        // cache_strategy:同 scheduler_algorithm,只接受已知取值。
+        if k == "cache_strategy" {
+            let ok = v.as_str().and_then(|s| {
+                gw_core::config::CacheStrategy::SELECTABLE
+                    .iter()
+                    .find(|a| a.as_str() == s.trim())
+            });
+            match ok {
+                Some(a) => {
+                    overlay_map.insert(k, serde_json::json!(a.as_str()));
+                }
+                None => {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        "cache_strategy 须为 sim(前缀模拟器)、credit_correct(按积分纠正冷热)或 credit_fit(按积分拟合命中比例)",
+                    )
+                }
+            }
+            continue;
+        }
+        // kiro_extra_models:热追加的 Kiro 模型。worker 遇到非法表整组拒收、沿用旧表,所以写侧
+        // 必须用**同一套**规则先拦住(gw_kiro::converter::validate_extra_models),否则面板显示的
+        // 表和实际生效的表分叉。拼错的键也在这里拦:DTO 为了新旧版本兼容不拒未知字段。
+        if k == "kiro_extra_models" {
+            match parse_kiro_extra_models(&v) {
+                Ok(specs) => {
+                    overlay_map.insert(k, serde_json::json!(specs));
+                }
+                Err(e) => {
+                    return api_error(StatusCode::BAD_REQUEST, &format!("kiro_extra_models 不合法: {e}"))
+                }
+            }
+            continue;
+        }
+        // cache_credit_models:积分反推参数表。worker 热应用时遇到非法表会整张拒收并保留旧表,
+        // 所以写侧必须先拦住,否则面板显示的表和实际生效的表分叉。
+        if k == "cache_credit_models" {
+            let parsed: Result<
+                std::collections::BTreeMap<String, gw_core::config::CreditModelSpec>,
+                _,
+            > = serde_json::from_value(v.clone());
+            let checked = parsed
+                .map_err(|e| format!("格式应为 {{\"模型id\": {{\"miss\": 数, \"hit\": 数, \"out\": 数, \"base\": 数}}}}: {e}"))
+                .and_then(|m| gw_core::config::validate_credit_models(&m).map(|()| m));
+            match checked {
+                Ok(m) => {
+                    overlay_map.insert(k, serde_json::json!(m));
+                }
+                Err(e) => {
+                    return api_error(StatusCode::BAD_REQUEST, &format!("cache_credit_models 不合法: {e}"))
+                }
+            }
+            continue;
+        }
+        if k == "cache_credit_max_output" {
+            match v.as_u64().filter(|n| *n <= 100_000) {
+                Some(n) => {
+                    overlay_map.insert(k, serde_json::json!(n));
+                }
+                None => {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        "cache_credit_max_output 须为 0–100000 之间的整数(输出 token 超过它的请求退回模拟器)",
+                    )
+                }
+            }
+            continue;
+        }
+        // 最优控制调度器参数:范围与调度器内部钳位一致;越界直接 400 给一句人话,
+        // 而不是写进去再被静默钳位(面板显示与实际生效分叉)。
+        if let Some((lo, hi, int_only, hint)) = cost_index_param_range(&k) {
+            let n = v.as_f64().filter(|n| n.is_finite());
+            let valid = n.is_some_and(|n| {
+                n >= lo && n <= hi && (!int_only || (n.fract() == 0.0 && v.is_u64()))
+            });
+            if !valid {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("{k} 须为 {lo}–{hi} 之间的{}({hint})", if int_only { "整数" } else { "数值" }),
+                );
+            }
+            overlay_map.insert(k, v);
+            continue;
+        }
+        overlay_map.insert(k, v);
+    }
+
+    // 校验合并后的 overlay 能解析为 SystemSettings(类型不符直接拒,不写坏库)。
+    let overlay: SystemSettings = match serde_json::from_value(serde_json::Value::Object(
+        overlay_map.clone(),
+    )) {
+        Ok(s) => s,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, &format!("设置字段不合法: {e}")),
+    };
+    // 拼错 key 的保护。`SystemSettings` 的 `deny_unknown_fields` 已于 2026-07-31 移除
+    // (它同时卡死了 worker 读侧的容错,一个陌生 key 就让整份 overlay 归零 → 全量 503,
+    // 见该结构体的文档),保护改由**写侧**承担:`unknown` 装的就是没被任何字段认领的 key。
+    //
+    // 拒绝范围 = **本次 patch** 里的未知键(对抗审核 [中]):overlay 里残留的「更新镜像
+    // 写入、本版本不认识」的键**原样保留** —— 否则回滚到旧 router 后,库里残留的新字段
+    // 会让任何普通设置写入都被整体 400 锁死,运维还没有正常手段清理。拼错保护不变:
+    // 拼错的键必然出现在本次 patch 里。要清残留键,显式 PUT `{"那个键": null}` 即可。
+    let bad: Vec<&str> = overlay
+        .unknown_keys()
+        .into_iter()
+        .filter(|k| patch_keys.contains(*k))
+        .collect();
+    if !bad.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("未知设置字段: {}", bad.join(", ")),
+        );
+    }
+
+    let json = serde_json::to_string(&overlay_map).unwrap_or_else(|_| "{}".into());
+    if let Err(e) = st.store.upsert_settings(&json) {
+        return internal_error(e);
+    }
+    respond(effective(&st, &overlay))
+}
+
+/// `kiro_extra_models` 写侧校验:必须是对象数组、每个对象只含认识的键,再走 gw-kiro 那套语义校验
+/// (与 worker 读侧同一个函数)。
+fn parse_kiro_extra_models(v: &serde_json::Value) -> Result<Vec<gw_core::config::KiroExtraModelSpec>, String> {
+    let arr = v.as_array().ok_or("须为数组(空数组 = 清空)")?;
+    for (i, item) in arr.iter().enumerate() {
+        let obj = item.as_object().ok_or_else(|| format!("第 {} 条须为对象", i + 1))?;
+        if let Some(bad) = obj.keys().find(|k| !gw_core::config::KIRO_EXTRA_MODEL_KEYS.contains(&k.as_str())) {
+            return Err(format!(
+                "第 {} 条有不认识的键 {bad:?}(可用:{})",
+                i + 1,
+                gw_core::config::KIRO_EXTRA_MODEL_KEYS.join(", ")
+            ));
+        }
+    }
+    let specs: Vec<gw_core::config::KiroExtraModelSpec> =
+        serde_json::from_value(v.clone()).map_err(|e| format!("字段类型不对: {e}"))?;
+    gw_kiro::converter::validate_extra_models(&specs)?;
+    Ok(specs)
+}
+
+/// 最优控制调度器数值参数的允许范围:`(下限, 上限, 是否必须整数, 说明)`。
+/// 与 `worker::cost_index::CiParams::from_config` 的钳位保持一致。
+fn cost_index_param_range(key: &str) -> Option<(f64, f64, bool, &'static str)> {
+    Some(match key {
+        "cost_index_kappa" => (0.0, 100.0, false, "积分/秒,多等 1 秒愿意付的积分"),
+        "cost_index_eta" => (0.0, 1000.0, false, "积分/次,每次 429 的风险成本"),
+        "cost_index_enterprise_price" => (0.01, 100.0, false, "企业号每积分相对个人号的倍数"),
+        "cost_index_start_spacing_ms" => (0.0, 10_000.0, true, "毫秒,0 = 不限"),
+        "cost_index_pace_ms" => (0.0, 60_000.0, true, "毫秒"),
+        "cost_index_pace_max_strikes" => (0.0, 100.0, true, "次,0 = 永不退回冷却"),
+        "cost_index_max_wait_ms" => (0.0, 120_000.0, true, "毫秒,须远小于 180 秒的请求重试时限"),
+        "cost_index_cache_ttl_secs" => (1.0, 3600.0, true, "秒"),
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests_support::{app, req};
+    use super::{worker_row, Fetched};
+    use axum::body::to_bytes;
+    use tower::ServiceExt;
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn get_returns_yaml_defaults_when_no_overlay() {
+        let (app, _store) = app();
+        let resp = app.oneshot(req("GET", "/settings", None)).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        // 默认 SystemConfig:max_failures=5、cache_read_multiplier=1.0、无 default_proxy。
+        assert_eq!(v["max_failures"], 5);
+        assert_eq!(v["cache_read_multiplier"], 1.0);
+        assert!(v.get("default_proxy").map(|d| d.is_null()).unwrap_or(true));
+    }
+
+    #[test]
+    fn 抓不到或没有settings字段的worker绝不能被当成一致() {
+        // 连不上 → online=false,没有任何「一致」可言。
+        let off = worker_row(0, "G0", Fetched::Unreachable);
+        assert_eq!(off["online"], false);
+        assert_eq!(off["stale_image"], false);
+        assert!(off["settings"].is_null());
+
+        // **答得出话就说明进程活着**,只是没这个路由(旧镜像 404)。
+        // 报成「离线」会让人去查容器是不是死了,而真正该做的是重建镜像 ——
+        // 2026-08-06 上线时 caio-worker-dario 正是这种,一度被判成掉线。
+        let stale = worker_row(1, "DARIO", Fetched::NoData);
+        assert_eq!(stale["online"], true, "404 不等于进程死了");
+        assert_eq!(stale["stale_image"], true);
+
+        // 2xx 但回包里没有 settings 字段,同样是旧镜像。
+        // 漏标的话前端会拿 null 走「无差异」分支渲染绿勾 —— 恰好在本功能唯一存在的理由上说谎。
+        let nofield = worker_row(2, "G0", Fetched::Body(serde_json::json!({"role":"worker"})));
+        assert_eq!(nofield["online"], true);
+        assert_eq!(nofield["stale_image"], true, "旧镜像必须单独标出,不能混进「一致」");
+
+        // settings 显式为 null 同样算旧镜像,不能当成「有数据」。
+        let nulled = worker_row(3, "G0", Fetched::Body(serde_json::json!({"settings": null})));
+        assert_eq!(nulled["stale_image"], true);
+
+        // 正常回包才透传。
+        let ok = worker_row(
+            4,
+            "G0",
+            Fetched::Body(serde_json::json!({"settings": {"applied_at": 42, "provider_hot": true}})),
+        );
+        assert_eq!(ok["online"], true);
+        assert_eq!(ok["stale_image"], false);
+        assert_eq!(ok["settings"]["applied_at"], 42);
+    }
+
+    #[tokio::test]
+    async fn get_带上逐worker的实然值而put不带() {
+        // 这是「保存了不生效」唯一能被看见的地方:GET 回的是应然值(库+YAML),
+        // `workers` 回的是各 worker 真正在用的值。两者必须在**同一份响应**里,
+        // 否则面板要么显示不出差异、要么得再开一个接口。
+        let (app, _store) = app();
+        let resp = app.clone().oneshot(req("GET", "/settings", None)).await.unwrap();
+        let v = body_json(resp).await;
+        assert!(v["workers"].is_array(), "GET 必须带 workers(没有 worker 时是空数组)");
+
+        // PUT **不带**:刚写完库时 worker 还没轮询到,回一份必然过时的实然值
+        // 只会让人误判成「没生效」。
+        let resp = app
+            .oneshot(req("PUT", "/settings", Some(r#"{"cache_floor_ratio":0.5}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["cache_floor_ratio"], 0.5);
+        assert!(v.get("workers").is_none(), "PUT 不该回 workers");
+    }
+
+    /// 批量任务拦截与小请求保底阈值:写侧归一化、非法值 400、GET 回显有效值。
+    #[tokio::test]
+    async fn put_batch_guard_and_floor_min_input() {
+        let (app, _store) = app();
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                "/settings",
+                Some(r#"{"batch_guard_mode":" Enforce ","batch_guard_threshold":40,"batch_guard_block_prefixes":[" You are a strict, calibrated senior VFX art director ","You are a strict, calibrated senior VFX art director"],"cache_floor_min_input":100000}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["batch_guard_mode"], "enforce", "大小写/空白归一");
+        assert_eq!(v["batch_guard_threshold"], 40);
+        assert_eq!(
+            v["batch_guard_block_prefixes"],
+            serde_json::json!(["You are a strict, calibrated senior VFX art director"]),
+            "去空白、去重"
+        );
+        assert_eq!(v["cache_floor_min_input"], 100000);
+        assert_eq!(v["batch_guard_window_secs"], 600, "没写的键回显默认");
+
+        for bad in [
+            r#"{"batch_guard_mode":"block"}"#,
+            r#"{"batch_guard_threshold":1}"#,
+            r#"{"batch_guard_window_secs":"600"}"#,
+            r#"{"batch_guard_block_prefixes":[""]}"#,
+            r#"{"cache_floor_min_input":-1}"#,
+        ] {
+            let resp = app.clone().oneshot(req("PUT", "/settings", Some(bad))).await.unwrap();
+            assert_eq!(resp.status(), 400, "应拒绝 {bad}");
+        }
+        // 拒绝不污染已存值。
+        let v = body_json(app.oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v["batch_guard_mode"], "enforce");
+        assert_eq!(v["batch_guard_threshold"], 40);
+    }
+
+    /// 拒答记忆:写侧归一化、非法值 400、没写的键回显默认(observe / 1 次 / 2 小时)。
+    #[tokio::test]
+    async fn put_refusal_guard_settings() {
+        let (app, _store) = app();
+        let v = body_json(app.clone().oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v["refusal_guard_mode"], "observe", "代码默认只观察");
+        assert_eq!(v["refusal_guard_retries"], 1);
+        assert_eq!(v["refusal_guard_ttl_secs"], 7200);
+
+        let resp = app
+            .clone()
+            .oneshot(req("PUT", "/settings", Some(r#"{"refusal_guard_mode":" ENFORCE ","refusal_guard_retries":0}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["refusal_guard_mode"], "enforce", "大小写/空白归一");
+        assert_eq!(v["refusal_guard_retries"], 0);
+
+        for bad in [
+            r#"{"refusal_guard_mode":"block"}"#,
+            r#"{"refusal_guard_retries":6}"#,
+            r#"{"refusal_guard_ttl_secs":10}"#,
+            r#"{"refusal_guard_ttl_secs":"7200"}"#,
+        ] {
+            let resp = app.clone().oneshot(req("PUT", "/settings", Some(bad))).await.unwrap();
+            assert_eq!(resp.status(), 400, "应拒绝 {bad}");
+        }
+        let v = body_json(app.oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v["refusal_guard_mode"], "enforce", "拒绝不污染已存值");
+    }
+
+    /// 号池熔断:默认 enforce / 30 分钟 / 3 个号;写侧归一化、非法值 400。
+    #[tokio::test]
+    async fn put_pool_breaker_settings() {
+        let (app, _store) = app();
+        let v = body_json(app.clone().oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v["pool_breaker_mode"], "enforce", "用户要求上线即熔断");
+        assert_eq!(v["pool_breaker_window_secs"], 1800);
+        assert_eq!(v["pool_breaker_threshold"], 3);
+
+        let resp = app
+            .clone()
+            .oneshot(req("PUT", "/settings", Some(r#"{"pool_breaker_mode":" Observe ","pool_breaker_threshold":4}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["pool_breaker_mode"], "observe");
+        assert_eq!(v["pool_breaker_threshold"], 4);
+
+        for bad in [
+            r#"{"pool_breaker_mode":"pause"}"#,
+            r#"{"pool_breaker_threshold":1}"#,
+            r#"{"pool_breaker_window_secs":60}"#,
+        ] {
+            let resp = app.clone().oneshot(req("PUT", "/settings", Some(bad))).await.unwrap();
+            assert_eq!(resp.status(), 400, "应拒绝 {bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn put_stores_overlay_and_get_reflects_it() {
+        let (app, _store) = app();
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                "/settings",
+                Some(r#"{"rate_limit_cooldown_secs": 600, "default_proxy": "socks5://h:1080"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["rate_limit_cooldown_secs"], 600);
+        assert_eq!(v["default_proxy"], "socks5://h:1080");
+        // 再 GET 应持久反映。
+        let resp2 = app.oneshot(req("GET", "/settings", None)).await.unwrap();
+        let v2 = body_json(resp2).await;
+        assert_eq!(v2["rate_limit_cooldown_secs"], 600);
+        assert_eq!(v2["default_proxy"], "socks5://h:1080");
+    }
+
+    #[tokio::test]
+    async fn get_exposes_default_thinking_effort() {
+        // 前端要靠它渲染当前生效档位;字段一旦漏了,下拉框就没有初值。
+        let (app, _store) = app();
+        let v = body_json(app.oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(
+            v["default_thinking_effort"],
+            gw_core::config::DEFAULT_THINKING_EFFORT.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn put_default_thinking_effort_stores_canonical_lowercase() {
+        let (app, _store) = app();
+        let v = body_json(
+            app.clone()
+                .oneshot(req("PUT", "/settings", Some(r#"{"default_thinking_effort":"XHigh"}"#)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        // 归一成小写后存 —— 上游只认小写形态,不能原样把用户输入透过去。
+        assert_eq!(v["default_thinking_effort"], "xhigh");
+        let v2 = body_json(app.oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v2["default_thinking_effort"], "xhigh", "应持久");
+    }
+
+    #[tokio::test]
+    async fn put_rejects_illegal_thinking_effort() {
+        // 脏档位会原样进 wire 换来上游 400,且要等下一次真实请求才暴露 —— 必须写库前就挡。
+        let (app, _store) = app();
+        let resp = app
+            .clone()
+            .oneshot(req("PUT", "/settings", Some(r#"{"default_thinking_effort":"ludicrous"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let v = body_json(resp).await;
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("ludicrous"), "错误里要点名非法值,实际={msg}");
+        assert!(msg.contains("xhigh"), "错误里要列出可选档位,实际={msg}");
+        // 关键:被拒后库里不该留下任何痕迹,仍是基线默认。
+        let v2 = body_json(app.oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(
+            v2["default_thinking_effort"],
+            gw_core::config::DEFAULT_THINKING_EFFORT.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn put_empty_thinking_effort_resets_to_baseline() {
+        let (app, _store) = app();
+        app.clone()
+            .oneshot(req("PUT", "/settings", Some(r#"{"default_thinking_effort":"low"}"#)))
+            .await
+            .unwrap();
+        // 空串 = 清 overlay 回 YAML 基线(与 default_proxy 同口径)。
+        let v = body_json(
+            app.clone()
+                .oneshot(req("PUT", "/settings", Some(r#"{"default_thinking_effort":"  "}"#)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            v["default_thinking_effort"],
+            gw_core::config::DEFAULT_THINKING_EFFORT.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn put_null_resets_field_to_yaml_default() {
+        let (app, _store) = app();
+        // 先设 overlay。
+        app.clone()
+            .oneshot(req("PUT", "/settings", Some(r#"{"max_failures": 1}"#)))
+            .await
+            .unwrap();
+        // null 重置回 YAML 默认(5)。
+        let resp = app
+            .clone()
+            .oneshot(req("PUT", "/settings", Some(r#"{"max_failures": null}"#)))
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        assert_eq!(v["max_failures"], 5, "null 应回退到 YAML 默认");
+    }
+
+    #[tokio::test]
+    async fn put_rejects_wrong_type() {
+        let (app, _store) = app();
+        let resp = app
+            .oneshot(req("PUT", "/settings", Some(r#"{"max_failures": "not-a-number"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "类型不合法应 400,不写坏库");
+    }
+
+    #[tokio::test]
+    async fn scheduler_algorithm_defaults_roundtrip_and_rejects_unknown() {
+        let (app, _store) = app();
+        // 默认:最优控制调度器 + 报告推荐参数。
+        let v0 = body_json(app.clone().oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v0["scheduler_algorithm"], "cost_index");
+        assert_eq!(v0["cost_index_kappa"], 1.0);
+        assert_eq!(v0["cost_index_max_wait_ms"], 30_000);
+        assert_eq!(v0["cost_index_pace_personal"], false);
+        // 切到旧版并回读。
+        let v = body_json(
+            app.clone()
+                .oneshot(req("PUT", "/settings", Some(r#"{"scheduler_algorithm": "affinity", "cost_index_kappa": 0.3, "cost_index_pace_personal": true}"#)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["scheduler_algorithm"], "affinity");
+        assert_eq!(v["cost_index_kappa"], 0.3);
+        assert_eq!(v["cost_index_pace_personal"], true);
+        // 未知算法、非字符串一律 400,且不改动已存值。
+        for bad in [r#""foo""#, r#""unknown""#, "1"] {
+            let resp = app
+                .clone()
+                .oneshot(req("PUT", "/settings", Some(format!(r#"{{"scheduler_algorithm": {bad}}}"#).as_str())))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{bad} 应 400");
+        }
+        let v2 = body_json(app.clone().oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v2["scheduler_algorithm"], "affinity");
+        // null 清除回默认。
+        let v3 = body_json(
+            app.oneshot(req("PUT", "/settings", Some(r#"{"scheduler_algorithm": null}"#))).await.unwrap(),
+        )
+        .await;
+        assert_eq!(v3["scheduler_algorithm"], "cost_index");
+    }
+
+
+
+    #[tokio::test]
+    async fn cache_strategy_settings_roundtrip_and_reject_bad_values() {
+        let (app, _store) = app();
+        // 默认:模拟器策略 + 内置参数表(上线不改变行为)。
+        let v0 = body_json(app.clone().oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v0["cache_strategy"], "sim");
+        assert_eq!(v0["cache_credit_max_output"], 1500);
+        assert_eq!(v0["cache_credit_discount_only"], false);
+        assert_eq!(v0["cache_io_correction"], false, "输入输出口径修正默认关");
+        assert_eq!(v0["cache_credit_enterprise"], true, "企业号默认也走积分反推");
+        assert!(v0["cache_credit_models"]["claude-opus-5.5"]["miss"].is_number());
+        let v = body_json(
+            app.clone()
+                .oneshot(req(
+                    "PUT",
+                    "/settings",
+                    Some(r#"{"cache_strategy": " credit_correct ", "cache_credit_max_output": 800, "cache_credit_discount_only": true,
+                            "cache_io_correction": true, "cache_credit_enterprise": false,
+                            "cache_credit_models": {"claude-opus-5.5": {"miss": 1.2, "hit": 0.35, "out": 0.44, "base": -0.01}}}"#),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["cache_strategy"], "credit_correct", "去空白后按规范值落库");
+        assert_eq!(v["cache_credit_max_output"], 800);
+        assert_eq!(v["cache_credit_discount_only"], true);
+        assert_eq!(v["cache_io_correction"], true);
+        assert_eq!(v["cache_credit_enterprise"], false);
+        assert_eq!(v["cache_credit_models"]["claude-opus-5.5"]["hit"], 0.35);
+        assert!(v["cache_credit_models"].get("claude-sonnet-5.5").is_none(), "表整体替换");
+        for (k, bad) in [
+            ("cache_strategy", r#""unknown""#),
+            ("cache_strategy", r#""credit""#),
+            ("cache_strategy", "1"),
+            ("cache_credit_max_output", "-1"),
+            ("cache_credit_max_output", "100001"),
+            ("cache_credit_max_output", "1.5"),
+            ("cache_credit_models", r#"{"m": {"miss": 0.3, "hit": 0.3, "out": 0.1}}"#),
+            ("cache_credit_models", r#"{"m": {"miss": 1.0, "hit": 0.3}}"#),
+            ("cache_credit_models", r#"{"": {"miss": 1.0, "hit": 0.3, "out": 0.1}}"#),
+            ("cache_credit_models", r#"[1, 2]"#),
+            ("cache_io_correction", r#""yes""#),
+            ("cache_io_correction", "1"),
+            ("cache_credit_enterprise", r#""no""#),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(req("PUT", "/settings", Some(format!(r#"{{"{k}": {bad}}}"#).as_str())))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{k}={bad} 应 400");
+        }
+        let v2 = body_json(app.clone().oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v2["cache_strategy"], "credit_correct", "非法写入不改动已存值");
+        assert_eq!(v2["cache_credit_models"]["claude-opus-5.5"]["miss"], 1.2);
+        assert_eq!(v2["cache_io_correction"], true);
+        // null 清除回默认表。
+        let v3 = body_json(
+            app.oneshot(req("PUT", "/settings", Some(r#"{"cache_credit_models": null, "cache_strategy": null}"#)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v3["cache_strategy"], "sim");
+        assert!(v3["cache_credit_models"]["claude-sonnet-5.5"].is_object());
+    }
+
+    /// kiro_extra_models:合法表落库(pro_only 缺省补 true)、各类非法写入 400 且不改已存值、null 清空。
+    #[tokio::test]
+    async fn kiro_extra_models_roundtrip_and_validation() {
+        let (app, _store) = app();
+        let ok = r#"{"kiro_extra_models": [{"id": "claude-haiku-6", "kiro_model": "claude-haiku-6",
+                     "like": "claude-sonnet-5-5", "effort_levels": ["low", "medium"]}]}"#;
+        let v = body_json(app.clone().oneshot(req("PUT", "/settings", Some(ok))).await.unwrap()).await;
+        assert_eq!(v["kiro_extra_models"][0]["id"], "claude-haiku-6");
+        assert_eq!(v["kiro_extra_models"][0]["pro_only"], true, "缺省补 true 后落库");
+        for bad in [
+            r#"{"id": "claude-sonnet-5-5", "kiro_model": "x.1", "like": "claude-sonnet-5-5"}"#,
+            r#"{"id": "claude-x-1", "kiro_model": "x.1", "like": "claude-nope"}"#,
+            r#"{"id": "claude-x-1", "kiro_model": "x.1", "like": "claude-sonnet-5-5", "efort_levels": []}"#,
+            r#"{"id": "claude-x-1", "kiro_model": "x.1", "like": "claude-sonnet-5-5", "context_window": "1M"}"#,
+            r#"{"id": "claude-x-1", "kiro_model": "x.1", "like": "claude-sonnet-5-5", "default_effort": "max", "effort_levels": ["low"]}"#,
+            r#""claude-x-1""#,
+        ] {
+            let body = format!(r#"{{"kiro_extra_models": [{bad}]}}"#);
+            let resp = app.clone().oneshot(req("PUT", "/settings", Some(body.as_str()))).await.unwrap();
+            assert_eq!(resp.status(), 400, "{bad} 应 400");
+        }
+        let resp = app
+            .clone()
+            .oneshot(req("PUT", "/settings", Some(r#"{"kiro_extra_models": {"id": "x"}}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "非数组应 400");
+        let v2 = body_json(app.clone().oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v2["kiro_extra_models"][0]["id"], "claude-haiku-6", "非法写入不改动已存值");
+        let v3 = body_json(
+            app.oneshot(req("PUT", "/settings", Some(r#"{"kiro_extra_models": null}"#))).await.unwrap(),
+        )
+        .await;
+        assert_eq!(v3["kiro_extra_models"], serde_json::json!([]), "null 清掉 overlay → 回 yaml 基线(空)");
+    }
+
+    #[tokio::test]
+    async fn env_normalize_settings_roundtrip_and_validation() {
+        let (app, _store) = app();
+        let v0 = body_json(app.clone().oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v0["env_normalize_providers"], serde_json::json!([]), "默认全关");
+        assert_eq!(v0["env_normalize_timezone"], "Asia/Singapore");
+        assert_eq!(v0["env_normalize_locale"], "en-US");
+        let v = body_json(
+            app.clone()
+                .oneshot(req(
+                    "PUT",
+                    "/settings",
+                    Some(r#"{"env_normalize_providers": ["claude-dario", " claude-dario", "kiro"], "env_normalize_timezone": " America/New_York ", "env_normalize_locale": "en-GB"}"#),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["env_normalize_providers"], serde_json::json!(["claude-dario", "kiro"]), "去空白、去重、排序");
+        assert_eq!(v["env_normalize_timezone"], "America/New_York");
+        assert_eq!(v["env_normalize_locale"], "en-GB");
+        for (k, bad) in [
+            ("env_normalize_providers", r#"["openai"]"#),
+            ("env_normalize_providers", r#""claude-dario""#),
+            ("env_normalize_providers", "[1]"),
+            ("env_normalize_timezone", r#""Shanghai""#),
+            ("env_normalize_timezone", "8"),
+            ("env_normalize_locale", r#""zh_CN""#),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(req("PUT", "/settings", Some(format!(r#"{{"{k}": {bad}}}"#).as_str())))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{k}={bad} 应 400");
+        }
+        let v2 = body_json(app.oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v2["env_normalize_providers"], serde_json::json!(["claude-dario", "kiro"]), "非法写入不改动已存值");
+    }
+
+    #[tokio::test]
+    async fn cost_index_params_are_range_checked() {
+        let (app, _store) = app();
+        for (k, bad) in [
+            ("cost_index_kappa", "-0.1"),
+            ("cost_index_kappa", "101"),
+            ("cost_index_eta", "1001"),
+            ("cost_index_enterprise_price", "0"),
+            ("cost_index_start_spacing_ms", "10001"),
+            ("cost_index_start_spacing_ms", "1.5"),
+            ("cost_index_pace_ms", "-1"),
+            ("cost_index_pace_max_strikes", "101"),
+            ("cost_index_max_wait_ms", "120001"),
+            ("cost_index_cache_ttl_secs", "0"),
+            ("cost_index_kappa", r#""1""#),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(req("PUT", "/settings", Some(format!(r#"{{"{k}": {bad}}}"#).as_str())))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{k}={bad} 应 400");
+        }
+        let v = body_json(
+            app.oneshot(req(
+                "PUT",
+                "/settings",
+                Some(r#"{"cost_index_kappa": 0, "cost_index_eta": 10, "cost_index_enterprise_price": 2.5, "cost_index_start_spacing_ms": 0, "cost_index_max_wait_ms": 120000, "cost_index_cache_ttl_secs": 3600}"#),
+            ))
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(v["cost_index_kappa"], 0.0);
+        assert_eq!(v["cost_index_enterprise_price"], 2.5);
+        assert_eq!(v["cost_index_max_wait_ms"], 120_000);
+        assert_eq!(v["cost_index_cache_ttl_secs"], 3600);
+    }
+
+    #[tokio::test]
+    async fn put_history_thinking_turns_int_roundtrip_and_rejects_non_int() {
+        let (app, _store) = app();
+        // 任意整数都合法:0=全丢/默认,N>0=保留最近 N 段,负数=全保留。
+        let v = body_json(
+            app.clone()
+                .oneshot(req("PUT", "/settings", Some(r#"{"history_thinking_turns": -1}"#)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["history_thinking_turns"], -1);
+        let v2 = body_json(app.clone().oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v2["history_thinking_turns"], -1, "应持久并经 from_effective 回灌");
+
+        // 非整数(字符串/浮点/布尔)必须在写库前就挡下,且库里不留痕迹。
+        for bad in [r#""2""#, "1.5", "true"] {
+            let resp = app
+                .clone()
+                .oneshot(req(
+                    "PUT",
+                    "/settings",
+                    Some(format!(r#"{{"history_thinking_turns": {bad}}}"#).as_str()),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{bad} 不是整数,应 400");
+        }
+        let v3 = body_json(app.oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v3["history_thinking_turns"], -1, "被拒的写入不该改动已存值");
+    }
+
+
+    #[tokio::test]
+    async fn put_rejects_unknown_field() {
+        let (app, _store) = app();
+        // 拼错 key(max_failure 少了 s)应 400,不静默落库死 overlay。
+        // 机制已于 2026-07-31 从 `deny_unknown_fields` 换成「`SystemSettings::unknown` 非空即拒」
+        // —— 前者同时卡死了 worker 读侧的容错(一个陌生 key 作废整份 overlay → 全量 503)。
+        let resp = app
+            .oneshot(req("PUT", "/settings", Some(r#"{"max_failure": 1}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "未知字段应 400");
+    }
+
+    #[tokio::test]
+    async fn put_tolerates_preexisting_unknown_keys_from_newer_image() {
+        let (app, store) = app();
+        // 模拟「更新的镜像写入过新字段,随后回滚到本镜像」:overlay 里残留本版本
+        // 不认识的键。此时普通设置写入不该被整体锁死(对抗审核 [中])。
+        store.upsert_settings(r#"{"future_new_field": 1}"#).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(req("PUT", "/settings", Some(r#"{"max_failures": 3}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "与本次 patch 无关的残留未知键不该锁死写入");
+        let v = body_json(resp).await;
+        assert_eq!(v["max_failures"], 3);
+        // 残留键仍躺在库里(读侧宽容),可随时用 null 显式清掉。
+        let j = store.get_settings().unwrap().unwrap();
+        assert!(j.contains("future_new_field"), "与本 patch 无关的键应原样保留");
+        let resp = app
+            .clone()
+            .oneshot(req("PUT", "/settings", Some(r#"{"future_new_field": null}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "null 显式清理残留键要可用");
+        let j = store.get_settings().unwrap().unwrap();
+        assert!(!j.contains("future_new_field"));
+        // 但本次 patch 里拼错的 key 照样拒(拼错保护不变)。
+        let resp = app
+            .oneshot(req("PUT", "/settings", Some(r#"{"max_failure": 1}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn put_null_for_nonexistent_unknown_key_is_rejected() {
+        let (app, _store) = app();
+        // 复审 [中]:`{"拼错键": null}` 不得绕过拼错保护 —— null 在合并前删除,
+        // 到不了 unknown 校验,所以 null 分支里要单独探一次。
+        let resp = app
+            .clone()
+            .oneshot(req("PUT", "/settings", Some(r#"{"max_failure": null}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "不存在的未知键 + null = 拼错,应 400");
+        // 已知字段的 null(无残留时的 no-op 重置)不受影响。
+        let resp = app
+            .oneshot(req("PUT", "/settings", Some(r#"{"max_failures": null}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "已知字段的 null 重置照常");
+    }
+
+    #[tokio::test]
+    async fn put_unknown_field_error_names_the_key() {
+        let (app, _store) = app();
+        let resp = app
+            .oneshot(req("PUT", "/settings", Some(r#"{"max_failure": 1}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let s = String::from_utf8_lossy(&body);
+        assert!(
+            s.contains("max_failure"),
+            "报错要点名是哪个 key 拼错了,否则运维得自己猜:{s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_rejects_invalid_default_proxy() {
+        let (app, _store) = app();
+        // 含掩码占位的回传值必须拒绝(fail-closed,绝不把脱敏形态当真值存)。
+        let resp = app
+            .oneshot(req("PUT", "/settings", Some(r#"{"default_proxy": "socks5://u:***@h:1080"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "非法/掩码代理应 400");
+    }
+
+    #[tokio::test]
+    async fn put_default_proxy_password_redacted_in_response() {
+        let (app, _store) = app();
+        let resp = app
+            .oneshot(req(
+                "PUT",
+                "/settings",
+                Some(r#"{"default_proxy": "socks5://user:pass@host:1080"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(
+            v["default_proxy"], "socks5://user:***@host:1080",
+            "响应里默认代理的密码段必须掩码"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_requires_auth() {
+        let (app, _store) = app();
+        let unauth = axum::http::Request::builder()
+            .method("GET")
+            .uri("/settings")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(unauth).await.unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+}

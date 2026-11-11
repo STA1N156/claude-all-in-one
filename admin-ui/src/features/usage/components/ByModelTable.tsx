@@ -1,0 +1,99 @@
+import { Cpu } from 'lucide-react'
+
+import { TD, TR } from '@/components/ui/table'
+import { useI18n } from '@/lib/i18n'
+import { formatCompact, formatInt, formatUsd } from '@/lib/utils'
+
+import type { CostBasis, ModelUsage } from '../types'
+import { UsageTableCard } from './UsageTableCard'
+
+interface ByModelTableProps {
+  data: ModelUsage[] | undefined
+  loading: boolean
+  basis: CostBasis
+}
+
+/**
+ * Compact, table-first per-model usage. Instead of a standalone chart, the
+ * 请求数 cell carries a thin (4px) inline proportion bar relative to the
+ * busiest model — sparkline-in-a-table, not a hero chart.
+ */
+export function ByModelTable({ data, loading, basis }: ByModelTableProps) {
+  const { t } = useI18n()
+
+  const sorted = [...(data ?? [])].sort((a, b) => b.requests - a.requests)
+  const max = Math.max(...sorted.map((row) => row.requests), 1)
+
+  const rows = sorted.map((row) => {
+    const cacheRead = basis === 'billed' ? row.cache_read_tokens : row.real_cache_read_tokens
+    const cost = basis === 'billed' ? row.cost_billed_usd : row.cost_real_usd
+    // input_tokens 是总上下文(含缓存命中);展示未命中输入 = 总 - 命中,与成本/卡片口径一致。
+    const uncachedInput = Math.max(0, row.input_tokens - cacheRead)
+    return (
+      <TR key={row.model}>
+        <TD className="max-w-[280px] truncate py-2 text-[13px] font-medium" title={row.model}>
+          {row.model}
+        </TD>
+        <TD className="py-2 text-right">
+          <span className="inline-flex w-24 flex-col items-end gap-1 align-middle">
+            <span className="text-[13px] font-semibold leading-none tabular-nums">
+              {formatInt(row.requests)}
+            </span>
+            <span
+              className="h-1 w-full overflow-hidden rounded-full bg-black/[0.06] dark:bg-white/10"
+              aria-hidden="true"
+            >
+              <span
+                className="block h-full rounded-full bg-primary/60"
+                style={{ width: `${Math.max((row.requests / max) * 100, 2)}%` }}
+              />
+            </span>
+          </span>
+        </TD>
+        <TD className="py-2 text-right text-xs tabular-nums text-muted-foreground">
+          {formatInt(uncachedInput)}
+        </TD>
+        <TD className="py-2 text-right text-xs tabular-nums text-muted-foreground">
+          {formatInt(row.output_tokens)}
+        </TD>
+        <TD className="py-2 text-right text-xs tabular-nums text-muted-foreground">
+          {formatInt(cacheRead)}
+        </TD>
+        <TD className="py-2 text-right text-xs tabular-nums text-muted-foreground">
+          {row.metering_credit.toFixed(2)}
+        </TD>
+        <TD className="py-2 text-right text-xs tabular-nums text-muted-foreground">
+          {row.metering_credit > 0 ? formatCompact(uncachedInput / row.metering_credit) : '—'}
+        </TD>
+        <TD
+          className="py-2 text-right text-xs tabular-nums text-muted-foreground"
+          title={row.priced ? undefined : '未计价模型'}
+        >
+          <span className={row.priced ? undefined : 'opacity-40'}>
+            {formatUsd(cost)}
+          </span>
+        </TD>
+      </TR>
+    )
+  })
+
+  return (
+    <UsageTableCard
+      icon={Cpu}
+      title={t('table.byModel')}
+      count={data?.length}
+      loading={loading}
+      columns={[
+        { label: t('table.model') },
+        { label: t('table.requests'), right: true },
+        { label: t('table.input'), right: true },
+        { label: t('table.output'), right: true },
+        { label: t('table.cacheRead'), right: true },
+        { label: t('table.credit'), right: true },
+        { label: t('table.perCreditIn'), right: true },
+        { label: t('table.cost'), right: true },
+      ]}
+      rows={rows}
+    />
+  )
+}

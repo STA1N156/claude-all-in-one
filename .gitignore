@@ -1,0 +1,42 @@
+/target
+# 真实凭据/配置不入库(只保留 *.example.yaml)
+/config/instances.yaml
+/config/accounts.yaml
+/config/system.yaml
+# 部署机独有配置:*.env 含 API key;instances-* 含真实公网出口/放行 IP
+/config/*.env
+/config/instances-dario.yaml
+/config/instances-exp.yaml
+/data
+*.db
+*.db-wal
+*.db-shm
+# 运行日志(debug 日志可能含 token)
+/logs
+*.log
+# 本地运维脚本及密码文件不得入库
+/.pw
+/cmp.sh
+/audit.py
+/paired.py
+/split.py
+/verify.py
+# 服务器上直接改代码留下的编辑残留(勿入库)
+*.bak
+*.bak.*
+*.bak-*
+*.exp-bak
+
+# 交叉编译产物(bookworm 目标)与部署用的裸二进制
+/target-bookworm
+/caio-bin-new
+# 内部运维/评审过程文档:含服务器 IP、admin 路径、SSH 别名等运维细节。
+# 本仓库是**公开**仓库,这类文档不入库。
+/HANDOFF-*.md
+/.review-request-*.md
+# e2e 真号验证时 dump 出来的调试产物(含上百 MB 的测试二进制,勿入库)
+/.tmp-dump
+
+# 子机安装包的构建中间产物与产物(44MB 的 .run、bun 二进制、dario dist,勿入库)
+/.tmp-node-build
+/dist-node

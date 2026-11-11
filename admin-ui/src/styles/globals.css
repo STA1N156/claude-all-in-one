@@ -1,0 +1,320 @@
+@import "tailwindcss";
+
+/* Class-based dark mode (toggle `.dark` on <html>) */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  /* ==================== 品牌色(playmate 设计语言) ==================== */
+  --color-ink: #050505;   /* 近纯黑 — 暗色画布 / 反白文字 */
+  --color-acid: #d7ff2f;  /* 荧光黄绿 — 唯一强调色(CTA/激活态/高亮) */
+  --color-neon: #42f8ff;  /* 青蓝霓虹 — 仅用于辉光点缀 */
+
+  /* ==================== 浅色模式 — 暖米白纸面 ==================== */
+  --color-background: #f3f4ef;
+  --color-foreground: #161616;
+  --color-card: #ffffff;
+  --color-card-foreground: #161616;
+  --color-panel: #fbfbf8;
+  --color-popover: #ffffff;
+  --color-popover-foreground: #161616;
+  --color-primary: #161616;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: rgba(0, 0, 0, 0.05);
+  --color-secondary-foreground: #161616;
+  --color-muted: rgba(0, 0, 0, 0.05);
+  --color-muted-foreground: rgba(22, 22, 22, 0.46);
+  --color-accent: rgba(0, 0, 0, 0.05);
+  --color-accent-foreground: #161616;
+  --color-destructive: #e11d48;
+  --color-destructive-foreground: #ffffff;
+  --color-border: rgba(0, 0, 0, 0.1);
+  --color-input: #ffffff;
+  --color-ring: #161616;
+  --color-success: #047857;
+  --color-warning: #b45309;
+
+  /* 圆角系统 — 超大圆角是本设计语言的签名 */
+  --radius-sm: 0.625rem;  /* 10px */
+  --radius-md: 0.875rem;  /* 14px */
+  --radius-lg: 1.125rem;  /* 18px */
+  --radius-xl: 1.375rem;  /* 22px */
+  --radius-2xl: 1.75rem;  /* 28px - 卡片 */
+  --radius-3xl: 2rem;     /* 32px - 容器/面板 */
+
+  /* 字体 */
+  --font-sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-display: 'Arial Narrow', 'Liberation Sans Narrow', 'Helvetica Neue Condensed', Arial, sans-serif;
+
+  /* 霓虹辉光 */
+  --shadow-glow: 0 0 40px rgba(66, 248, 255, 0.26);
+}
+
+/* ==================== 深色模式 — ink 画布 ==================== */
+.dark {
+  --color-background: #050505;
+  --color-foreground: #f7f7f2;
+  --color-card: rgba(255, 255, 255, 0.06);
+  --color-card-foreground: #f7f7f2;
+  --color-panel: rgba(255, 255, 255, 0.04);
+  --color-popover: #101010;
+  --color-popover-foreground: #f7f7f2;
+  --color-primary: #d7ff2f;
+  --color-primary-foreground: #050505;
+  --color-secondary: rgba(255, 255, 255, 0.08);
+  --color-secondary-foreground: #f7f7f2;
+  --color-muted: rgba(255, 255, 255, 0.08);
+  --color-muted-foreground: rgba(247, 247, 242, 0.45);
+  --color-accent: rgba(255, 255, 255, 0.08);
+  --color-accent-foreground: #f7f7f2;
+  --color-destructive: #fb7185;
+  --color-destructive-foreground: #050505;
+  --color-border: rgba(255, 255, 255, 0.1);
+  --color-input: rgba(255, 255, 255, 0.05);
+  --color-ring: #d7ff2f;
+  --color-success: #34d399;
+  --color-warning: #fbbf24;
+}
+
+* {
+  border-color: var(--color-border);
+}
+
+/* ==================== 表单控件全局兜底 ==================== */
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]),
+textarea,
+select {
+  border-color: rgba(0, 0, 0, 0.14);
+}
+.dark input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]),
+.dark textarea,
+.dark select {
+  border-color: rgba(255, 255, 255, 0.14);
+}
+input:focus, textarea:focus, select:focus {
+  border-color: var(--color-ring);
+}
+
+body {
+  /* 浅色:近乎素色的暖米白,只留极淡的品牌染色 */
+  background:
+    radial-gradient(circle at top left, rgba(215, 255, 47, 0.07), transparent 28rem),
+    radial-gradient(circle at top right, rgba(66, 248, 255, 0.05), transparent 26rem),
+    var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+  min-height: 100vh;
+}
+.dark body {
+  /* 深色:playmate 标志性的双径向渐变(青蓝左上 / 暖红右上)落在近纯黑上 */
+  background:
+    radial-gradient(circle at top left, rgba(66, 248, 255, 0.14), transparent 32rem),
+    radial-gradient(circle at top right, rgba(255, 70, 85, 0.16), transparent 30rem),
+    #050505;
+}
+
+/* 选中文本 — acid 反白 */
+::selection {
+  background-color: var(--color-acid);
+  color: var(--color-ink);
+}
+
+/* ==================== 自定义滚动条 ==================== */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: rgba(0, 0, 0, 0.22);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+  transition: background-color 0.2s;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(0, 0, 0, 0.45);
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.2);
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(255, 255, 255, 0.4);
+}
+
+/* Firefox 兼容 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 0, 0, 0.22) transparent;
+}
+.dark * {
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+}
+
+/* ==================== 面板/卡片工具类(沿用旧类名作为主题 API) ==================== */
+
+/* 标准卡片:实色白卡 + 极轻边框 + 微阴影(深色:白色 6% 透明卡) */
+.glass-card {
+  background-color: var(--color-card);
+  border: 1px solid var(--color-border);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+.dark .glass-card {
+  box-shadow: none;
+}
+
+/* 强卡片 — 对话框/弹窗用(实色,投远影) */
+.glass-card-strong {
+  background-color: var(--color-popover);
+  border: 1px solid var(--color-border);
+  box-shadow:
+    0 24px 64px -12px rgba(0, 0, 0, 0.22),
+    0 8px 24px -8px rgba(0, 0, 0, 0.12);
+}
+.dark .glass-card-strong {
+  box-shadow:
+    0 24px 64px -12px rgba(0, 0, 0, 0.65),
+    0 8px 24px -8px rgba(0, 0, 0, 0.4);
+}
+
+/* Dialog 遮罩 */
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background-color: rgba(0, 0, 0, 0.55);
+}
+
+/* 轻面板 — 二级容器/工具栏 */
+.glass-card-subtle {
+  background-color: var(--color-panel);
+  border: 1px solid var(--color-border);
+}
+
+/* 侧边栏:恒为近黑(明暗模式都一样,playmate admin 的签名布局) */
+.glass-sidebar {
+  background-color: #111111;
+  color: #ffffff;
+}
+
+/* 顶部工具栏 */
+.glass-toolbar {
+  background-color: var(--color-panel);
+  border-bottom: 1px solid var(--color-border);
+}
+
+/* ==================== 排版工具类 ==================== */
+
+/* Eyebrow:章节小帽 — 超宽字距大写小字 */
+.eyebrow {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.32em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--color-foreground) 38%, transparent);
+}
+
+/* 大标题:压缩字体 + 超粗 + 负字距 */
+.display-title {
+  font-family: var(--font-display);
+  font-weight: 900;
+  letter-spacing: -0.04em;
+}
+
+/* ==================== 交互动画 ==================== */
+
+/* hover 浮起 + 阴影增强 */
+.hover-lift {
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  will-change: transform;
+}
+.hover-lift:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.1);
+}
+.dark .hover-lift:hover {
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.5);
+}
+
+/* ==================== 强调底色(原渐变按钮,现为 acid 实色) ==================== */
+.gradient-bg-primary {
+  background-color: var(--color-acid);
+  color: var(--color-ink);
+  transition: filter 0.2s ease, box-shadow 0.25s ease;
+}
+.gradient-bg-primary:hover {
+  filter: brightness(1.05);
+  box-shadow: 0 0 24px rgba(215, 255, 47, 0.35);
+}
+
+.gradient-border {
+  border: 1.5px solid var(--color-acid);
+}
+
+/* ==================== Ambient 暗色画布(登录页/品牌时刻) ==================== */
+.ambient-bg {
+  position: relative;
+  isolation: isolate;
+  background:
+    radial-gradient(circle at top left, rgba(66, 248, 255, 0.14), transparent 32rem),
+    radial-gradient(circle at top right, rgba(255, 70, 85, 0.16), transparent 30rem),
+    #050505;
+  color: #f7f7f2;
+}
+.ambient-bg::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.08;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.6'/%3E%3C/svg%3E");
+}
+.ambient-bg > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* ==================== 呼吸辉光(acid) ==================== */
+@keyframes breathe-glow {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(215, 255, 47, 0);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(215, 255, 47, 0.12), 0 0 28px rgba(215, 255, 47, 0.28);
+  }
+}
+.breathe-glow {
+  animation: breathe-glow 3s ease-in-out infinite;
+}
+
+/* ==================== Page Hero(页面头部容器,现为无框纯排版) ==================== */
+.page-hero {
+  position: relative;
+}
+
+/* ==================== Page Surface(透明,保留类名兼容) ==================== */
+.page-surface {
+  position: relative;
+}
+
+/* ==================== 噪点纹理 ==================== */
+.acrylic-noise {
+  position: relative;
+}
+.acrylic-noise::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.4'/%3E%3C/svg%3E");
+  opacity: 0.05;
+  mix-blend-mode: overlay;
+  border-radius: inherit;
+}

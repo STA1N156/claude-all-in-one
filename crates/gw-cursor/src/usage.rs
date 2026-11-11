@@ -1,0 +1,904 @@
+//! Cursor 官方账期用量(`DashboardService/GetCurrentPeriodUsage`)。
+//!
+//! 只读 ConnectRPC JSON,用账号专属出口 + Bearer(access_token)。**不发推理**,
+//! 与 Kiro 的 `getUsageLimits` 同角色:admin 账号表展示本周期已用/限额。
+//!
+//! 端点与字段口径对齐社区逆向(openusage / onWatch):金额单位是 **美分**,
+//! 我们入库/展示换算成美元。
+
+use gw_core::account::Account;
+use gw_core::error::{UpstreamError, UpstreamErrorKind};
+use gw_core::provider::{AccountQuota, OnDemandQuota, QuotaWindow};
+use serde::Deserialize;
+
+/// Connect 协议版本头(与 Run / GetServerConfig 一致)。
+const CONNECT_PROTOCOL_VERSION: &str = "1";
+
+const TIMEOUT_SECS: u64 = 20;
+
+/// 上游用 i32 上限表示「不限额」(客户端 UI 的 Unlimited 档)。当真额度显示会变成
+/// `$2147483647`,必须识别成哨兵值。
+const UNLIMITED_SENTINEL: i64 = i32::MAX as i64;
+
+/// 调一个 DashboardService 方法,回响应体文本。
+///
+/// 三个端点(用量 / 读超额 / 写超额)共用同一套鉴权头、超时与错误映射:上游对它们的
+/// 错误语义一致(401/403 = token 废,429 = 限流,5xx = 服务端),不该各写一遍。
+async fn dashboard_call(
+    client: &reqwest::Client,
+    account: &Account,
+    api_host: &str,
+    method: &str,
+    body: &serde_json::Value,
+) -> Result<String, UpstreamError> {
+    let token = account
+        .extra_str("access_token")
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            UpstreamError::new(
+                UpstreamErrorKind::TokenInvalid,
+                format!("cursor 账号没有 access_token,无法调 {method}"),
+            )
+        })?;
+
+    let host = api_host.trim().trim_end_matches('/');
+    let url = format!("https://{host}/aiserver.v1.DashboardService/{method}");
+
+    let resp = client
+        .post(&url)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("connect-protocol-version", CONNECT_PROTOCOL_VERSION)
+        .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| UpstreamError::network(format!("Cursor {method} 请求失败: {e}")))?;
+
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| UpstreamError::network(format!("读 Cursor {method} 响应失败: {e}")))?;
+
+    if !status.is_success() {
+        let kind = match status.as_u16() {
+            401 | 403 => UpstreamErrorKind::TokenInvalid,
+            429 => UpstreamErrorKind::RateLimited,
+            500..=599 => UpstreamErrorKind::ServerError,
+            _ => UpstreamErrorKind::Other,
+        };
+        // 上游把可读原因埋在 details[].debug.details 里(如「Payment method required」),
+        // 直接透 message 只会得到一个没信息量的 "Error"。
+        let detail = extract_error_detail(&text);
+        return Err(UpstreamError::new(
+            kind,
+            format!(
+                "Cursor {method} {}: {}",
+                status.as_u16(),
+                detail.unwrap_or_else(|| text.chars().take(200).collect::<String>())
+            ),
+        )
+        .with_status(status.as_u16()));
+    }
+
+    Ok(text)
+}
+
+/// 从 Connect 错误体里抽出人能看懂的原因。
+///
+/// 未绑支付方式时上游回的是 `{"code":"failed_precondition","message":"Error",
+/// "details":[{"debug":{"details":{"title":"Payment method required","detail":"..."}}}]}`
+/// —— `message` 恒为 "Error",真正的原因在 details 里,不抽出来运维只能看到 "Error"。
+fn extract_error_detail(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let d = v
+        .get("details")?
+        .as_array()?
+        .iter()
+        .find_map(|it| it.pointer("/debug/details"))?;
+    let title = d.get("title").and_then(|t| t.as_str()).unwrap_or_default();
+    let detail = d.get("detail").and_then(|t| t.as_str()).unwrap_or_default();
+    let msg = format!("{title} {detail}").trim().to_string();
+    (!msg.is_empty()).then_some(msg)
+}
+
+/// 查询当前账期用量(含超额)。`api_host` 默认 `api2.cursor.sh`。
+pub async fn get_account_quota(
+    client: &reqwest::Client,
+    account: &Account,
+    api_host: &str,
+) -> Result<AccountQuota, UpstreamError> {
+    let text = dashboard_call(
+        client,
+        account,
+        api_host,
+        "GetCurrentPeriodUsage",
+        &serde_json::json!({}),
+    )
+    .await?;
+    parse_period_usage(&text)
+}
+
+/// 读超额(on-demand)开关与上限:`GetHardLimit`。
+pub async fn get_on_demand(
+    client: &reqwest::Client,
+    account: &Account,
+    api_host: &str,
+) -> Result<OnDemandQuota, UpstreamError> {
+    let text = dashboard_call(
+        client,
+        account,
+        api_host,
+        "GetHardLimit",
+        &serde_json::json!({}),
+    )
+    .await?;
+    parse_hard_limit(&text)
+}
+
+/// 设超额上限:`SetHardLimit`。`limit_usd = None` 或 `Some(0)` = **关闭**超额。
+///
+/// 参数形态照抄官方客户端的个人号分支(团队号要带 team_id + hardLimitPerUser,
+/// 这里不涉及):
+/// - 开启: `{hardLimit: N, noUsageBasedAllowed: false, preserveHardLimitPerUser: true}`
+/// - 关闭: `{noUsageBasedAllowed: true, preserveHardLimitPerUser: true}`(不带 hardLimit)
+///
+/// ⚠️ `hard_limit` 是**美元整数**(上游 i32),不是美分。
+pub async fn set_on_demand(
+    client: &reqwest::Client,
+    account: &Account,
+    api_host: &str,
+    limit_usd: Option<u32>,
+) -> Result<(), UpstreamError> {
+    // 0 与 None 同义(客户端亦如此:金额填 0 即关闭),统一收敛成「关闭」。
+    let off = limit_usd.is_none_or(|v| v == 0);
+    let body = if off {
+        serde_json::json!({
+            "noUsageBasedAllowed": true,
+            "preserveHardLimitPerUser": true,
+        })
+    } else {
+        serde_json::json!({
+            "hardLimit": limit_usd.unwrap_or_default(),
+            "noUsageBasedAllowed": false,
+            "preserveHardLimitPerUser": true,
+        })
+    };
+    dashboard_call(client, account, api_host, "SetHardLimit", &body).await?;
+    Ok(())
+}
+
+/// 需要逐号同意数据保留政策的门控模型(NoZDR consent):`(model_id, consent_version)`。
+///
+/// 逆向口径来自上游 `ERROR_MODEL_BLOCKED` 错误体里的 `buttons[].dashboardAction`
+///(`enableNoZdrModelConsent`,args 带 `modelId` / `consentVersion`)。Cursor 以后
+/// 新增门控模型时往这里追加。
+pub const KNOWN_NOZDR_CONSENTS: &[(&str, &str)] =
+    &[("claude-fable-5", "fable-data-retention-v1")];
+
+/// 替账号点「Accept」:`DashboardService/SetUserNoZdrModelConsent`。
+///
+/// 与真实客户端在「Review Data Policy」弹窗点 Accept 完全等价 —— 只是 per-user
+/// 设置位,幂等,重复调无副作用。返回响应里的 `consented`。
+///
+/// 字段口径(`aiserver.v1.SetUserNoZdrModelConsentRequest`,桌面端 3.18.25 bundle):
+/// `model_id` / `enabled` / `acknowledged` / `consent_version`。
+pub async fn set_user_no_zdr_model_consent(
+    client: &reqwest::Client,
+    account: &Account,
+    api_host: &str,
+    model_id: &str,
+    consent_version: &str,
+) -> Result<bool, UpstreamError> {
+    let text = dashboard_call(
+        client,
+        account,
+        api_host,
+        "SetUserNoZdrModelConsent",
+        &serde_json::json!({
+            "modelId": model_id,
+            "enabled": true,
+            "acknowledged": true,
+            "consentVersion": consent_version,
+        }),
+    )
+    .await?;
+    parse_consented(&text)
+}
+
+/// 解析 `SetUserNoZdrModelConsent` 响应 → `consented`。缺字段按 false(没确认上),
+/// 让调用方下个周期重试,而不是假装同意过。
+pub fn parse_consented(body: &str) -> Result<bool, UpstreamError> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+        UpstreamError::new(
+            UpstreamErrorKind::Other,
+            format!("Cursor SetUserNoZdrModelConsent 响应不是 JSON: {e}"),
+        )
+    })?;
+    Ok(v
+        .get("consented")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false))
+}
+
+/// 解析 `GetHardLimit` JSON → [`OnDemandQuota`](不含已用金额,那在用量接口里)。
+pub fn parse_hard_limit(body: &str) -> Result<OnDemandQuota, UpstreamError> {
+    let v: HardLimitResponse = serde_json::from_str(body).map_err(|e| {
+        UpstreamError::new(
+            UpstreamErrorKind::Other,
+            format!("Cursor GetHardLimit 响应不是 JSON: {e}"),
+        )
+    })?;
+    // proto3 零值不序列化:`noUsageBasedAllowed` 缺省 = false = **已开启**。
+    let enabled = !v.no_usage_based_allowed.unwrap_or(false);
+    let raw = v.hard_limit.unwrap_or(0);
+    let unlimited = enabled && raw >= UNLIMITED_SENTINEL;
+    Ok(OnDemandQuota {
+        enabled,
+        // 未开启 / 不限额 / 上游没给 → 不报额度数字(避免把哨兵值或 0 当真上限显示)。
+        limit: (enabled && !unlimited && raw > 0).then_some(raw as f64),
+        used: 0.0, // 由用量接口填,见 parse_period_usage。
+        unlimited,
+    })
+}
+
+/// 解析 `GetCurrentPeriodUsage` JSON → [`AccountQuota`](美元口径)。
+pub fn parse_period_usage(body: &str) -> Result<AccountQuota, UpstreamError> {
+    let v: PeriodUsageResponse = serde_json::from_str(body).map_err(|e| {
+        UpstreamError::new(
+            UpstreamErrorKind::Other,
+            format!("Cursor 用量响应不是 JSON: {e}"),
+        )
+    })?;
+    let plan = v.plan_usage.ok_or_else(|| {
+        UpstreamError::new(UpstreamErrorKind::Other, "Cursor 用量响应缺少 planUsage")
+    })?;
+
+    // ## 四种形态,不是两种
+    //
+    // `includedSpend`/`limit` 是**套餐内**额度。付费号两个都给;**FREE 号两个都不给**
+    // (免费号没有套餐,上游只给 `totalSpend`/`bonusSpend` 与几个百分比)。
+    // 只缺其中一个而另一个字段能推出来的,也不是异常:
+    //   2026-09-08 bot3/4/5 实弹(团队/试用 seat):无 `includedSpend`,但
+    //   `remaining`+`limit` 都在 → 已用 = limit - remaining。此前按「缺一个=上游
+    //   改字段」报错,面板上这批号的额度栏整体空白。
+    // 只有「includedSpend 缺且 remaining/limit 凑不齐」才是真异常(上游改字段/账号
+    // 状态诡异)。
+    //
+    // 此前这里对「两个都缺」也报错,后果是 **FREE 号的配额查询整体失败** →
+    // 后台额度栏空白、档位也拿不到,只能翻上游原始报文才知道号是被降级了。
+    // 2026-08-17 三个新号在 20 分钟内被降级成 FREE 就是这么发现的(先 grok
+    // `ModelNotAvailable`、composer 随后不可用,而面板上什么线索都没有)。
+    let missing = || {
+        UpstreamError::new(
+            UpstreamErrorKind::Other,
+            "Cursor 用量响应缺 includedSpend/limit 字段(只缺一个 = 上游改了字段)",
+        )
+    };
+    let free_plan = plan.included_spend.is_none() && plan.limit.is_none();
+    // 官方单位美分 → 美元。剩余优先用服务端 remaining,缺则 limit - includedSpend。
+    // FREE 档没有套餐额度,三个数都是 0(不是"未知":免费号的套餐内额度确实是 0)。
+    let used = if free_plan {
+        0.0
+    } else if let Some(u) = plan.included_spend {
+        cents_to_usd(u)
+    } else if let (Some(r), Some(l)) = (plan.remaining, plan.limit) {
+        // 团队/试用 seat 形态:无 includedSpend,已用 = limit - remaining。
+        cents_to_usd(l - r)
+    } else {
+        return Err(missing());
+    };
+    let limit = if free_plan {
+        0.0
+    } else {
+        cents_to_usd(plan.limit.ok_or_else(missing)?)
+    };
+    let remaining = match plan.remaining {
+        Some(r) => cents_to_usd(r),
+        None => limit - used,
+    };
+    let mut q = AccountQuota::from_used_limit(used, limit);
+    // 档位:判据就是上面那个形态差异(有套餐额度 = 付费)。**不去猜具体档位名** ——
+    // GetMe 里没有会员字段(实测只有 authId/email/country/isEnterpriseUser 之类),
+    // 上游也没有别的只读端点给档位名,所以只报能证实的二分。
+    q.plan_tier = Some(if free_plan {
+        "FREE".into()
+    } else {
+        "PAID".into()
+    });
+    // from_used_limit 重算 remaining;若服务端给了 remaining(含超额负值语义外的口径),
+    // 以服务端为准,避免和 includedSpend/limit 舍入不一致。
+    q.remaining = remaining;
+    if limit > 0.0 {
+        q.percent_used = used / limit * 100.0;
+    } else if let Some(p) = plan
+        .total_percent_used
+        .filter(|p| p.is_finite() && *p >= 0.0)
+    {
+        q.percent_used = p;
+    }
+    q.currency = Some("USD".into());
+    // Cursor 有**三条**用量,不止超额一条(用户 2026-08-13 点名要齐):
+    //   1. 自家模型(Auto/Composer)用量 → planUsage.autoPercentUsed
+    //   2. 第三方前沿模型(claude/gpt)用量 → planUsage.apiPercentUsed
+    //   3. 超额(on-demand)→ spendLimitUsage(下面的 on_demand,已有)
+    // 前两条上游只给百分比,不给金额拆分 —— 用 QuotaWindow 承载(它就是为
+    // 「只有利用率%的多条用量」设计的,Anthropic 的 5h/7d 窗口同款),
+    // 不新增 AccountQuota 字段。缺省/非法值不造窗口,绝不把故障显示成 0%。
+    let mut windows = Vec::new();
+    let valid = |p: &f64| p.is_finite() && *p >= 0.0;
+    if let Some(p) = plan.auto_percent_used.filter(valid) {
+        windows.push(QuotaWindow {
+            label: "auto".into(),
+            percent_used: p,
+            reset_at: None,
+        });
+    }
+    if let Some(p) = plan.api_percent_used.filter(valid) {
+        windows.push(QuotaWindow {
+            label: "api".into(),
+            percent_used: p,
+            reset_at: None,
+        });
+    }
+    q.windows = windows;
+    // 超额已用/上限(美分 → 美元)。`spendLimitUsage` 在未开启超额时只有 limitType,
+    // 此时 limit/used 都推不出数字 → 不造 on_demand(开关状态由 GetHardLimit 定,
+    // 本接口无从判断,填 enabled=false 会和「已开启但零消费」撞车)。
+    q.on_demand = v.spend_limit_usage.as_ref().and_then(|s| {
+        let limit = s.limit_cents();
+        let used = s.used_cents();
+        // 上限与已用全无 → 该号没开超额(或上游没给),不报。
+        if limit.is_none() && used == 0 {
+            return None;
+        }
+        Some(OnDemandQuota {
+            // 能给出超额额度/用量,说明超额是开着的。
+            enabled: true,
+            limit: limit
+                .filter(|l| *l > 0 && *l < UNLIMITED_SENTINEL)
+                .map(cents_to_usd),
+            used: cents_to_usd(used),
+            unlimited: limit.is_some_and(|l| l >= UNLIMITED_SENTINEL),
+        })
+    });
+    Ok(q)
+}
+
+fn cents_to_usd(cents: i64) -> f64 {
+    cents as f64 / 100.0
+}
+
+/// Protobuf JSON 把 int64 编成**字符串**(`"includedSpend":"23222"`),
+/// 官方样例又是 number —— 两种都收。
+fn de_i64_lenient<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Num {
+        I(i64),
+        S(String),
+    }
+    match Option::<Num>::deserialize(d)? {
+        Some(Num::I(i)) => Ok(Some(i)),
+        Some(Num::S(s)) => s.trim().parse().map(Some).map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
+}
+
+/// `GetHardLimitResponse` —— 超额开关与上限。
+///
+/// ⚠️ `hard_limit` 单位是**美元整数**(与同 service 的 spendLimitUsage 美分口径不同)。
+/// `no_usage_based_allowed` 缺省(proto3 零值)= false = 已开启超额。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HardLimitResponse {
+    #[serde(default, deserialize_with = "de_i64_lenient")]
+    hard_limit: Option<i64>,
+    no_usage_based_allowed: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PeriodUsageResponse {
+    plan_usage: Option<PlanUsage>,
+    /// 超额(on-demand)用量。**未开启超额时上游只回 `limitType`**,数字字段全缺省。
+    spend_limit_usage: Option<SpendLimitUsage>,
+}
+
+/// 查询 Bot(Grok Bot / Sand)周池用量:`GetSandUsageStatus`。
+///
+/// 与套餐月池(`GetCurrentPeriodUsage`)是**独立的第三池**:付费号(Pro/Pro+/Ultra)
+/// 自带 Sand 资格,周重置。上游只回利用率百分比,不给绝对量 —— 用 [`QuotaWindow`]
+/// 承载(label 固定 `"bot"`),与 auto/api 两条窗口同形态。
+///
+/// 返回 `Ok(None)` = 该号没有非零 Bot 额度(免费号/未开通),不该显示 "bot 0%"
+/// 伪装成「有池但没用量」。查询失败(401/网络/…)照常 Err,由调用方决定忽略力度。
+pub async fn get_sand_usage(
+    client: &reqwest::Client,
+    account: &Account,
+    api_host: &str,
+) -> Result<Option<QuotaWindow>, UpstreamError> {
+    let text = dashboard_call(
+        client,
+        account,
+        api_host,
+        "GetSandUsageStatus",
+        &serde_json::json!({}),
+    )
+    .await?;
+    parse_sand_usage(&text)
+}
+
+/// 解析 `GetSandUsageStatus` JSON → Bot 池窗口。
+///
+/// 实测响应:`{"currentPeriodStart":"...","nextResetTimestampUtc":"...",
+/// "usagePercent":32.28,"hasAvailableUsage":true,"hasNonZeroIncludedLimit":true,...}`。
+/// SandClaimer 逆向口径:接口偶尔不回重置时间,此时 reset_at 留 None,
+/// 不做「周期起点+7天」的推算 —— 展示层缺个时间戳比显示一个算错的日期强。
+pub fn parse_sand_usage(body: &str) -> Result<Option<QuotaWindow>, UpstreamError> {
+    let v: SandUsageResponse = serde_json::from_str(body).map_err(|e| {
+        UpstreamError::new(
+            UpstreamErrorKind::Other,
+            format!("Cursor GetSandUsageStatus 响应不是 JSON: {e}"),
+        )
+    })?;
+    // 没有非零额度 = 该号没这个池(免费号/未领取资格),不造窗口。
+    if v.has_non_zero_included_limit == Some(false) {
+        return Ok(None);
+    }
+    let Some(p) = v.usage_percent.filter(|p| p.is_finite() && *p >= 0.0) else {
+        // 有池但没给百分比 = 上游改字段,不造 0% 假象。
+        return Ok(None);
+    };
+    let reset_at = v
+        .next_reset_timestamp_utc
+        .as_deref()
+        .and_then(parse_rfc3339_unix);
+    Ok(Some(QuotaWindow {
+        label: "bot".into(),
+        percent_used: p,
+        reset_at,
+    }))
+}
+
+/// `GetSandUsageStatusResponse`(只收我们用的字段,其余忽略)。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SandUsageResponse {
+    usage_percent: Option<f64>,
+    next_reset_timestamp_utc: Option<String>,
+    has_non_zero_included_limit: Option<bool>,
+}
+
+/// RFC3339 UTC("2026-09-09T05:30:33.460Z")→ unix 秒。
+///
+/// 与 gw-app `parse_rfc3339_unix` 同算法(Howard Hinnant civil→days),但上游
+/// 这个时间戳带毫秒小数,先把小数段剥掉。纯算术,不引 chrono。
+fn parse_rfc3339_unix(s: &str) -> Option<i64> {
+    let s = s.strip_suffix('Z').unwrap_or(s);
+    let (date, time) = s.split_once('T')?;
+    let mut d = date.split('-');
+    let year: i64 = d.next()?.parse().ok()?;
+    let month: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+    let mut t = time.split(':');
+    let hh: i64 = t.next()?.parse().ok()?;
+    let mm: i64 = t.next()?.parse().ok()?;
+    let ss_str = t.next().unwrap_or("0");
+    // 剥毫秒/微秒小数段("33.460" → "33")。
+    let ss: i64 = ss_str.split('.').next()?.parse().ok()?;
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hh * 3600 + mm * 60 + ss)
+}
+
+/// `GetCurrentPeriodUsageResponse.SpendLimitUsage` —— 超额账期用量。
+///
+/// ⚠️ 单位是**美分**(与同响应的 planUsage 一致),但与 `GetHardLimit.hard_limit` 的
+/// **美元**口径不同,换算别串。proto3 零值不序列化 → 无超额消费时 `individual_used`
+/// 缺省,按 0 处理(不是「未知」)。
+///
+/// 个人号看 `individual_*`;团队号才有 `pooled_*` / `overall_*`,这里一并收下,
+/// 取值时按 individual → overall 优先级回退。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpendLimitUsage {
+    #[serde(default, deserialize_with = "de_i64_lenient")]
+    individual_limit: Option<i64>,
+    #[serde(default, deserialize_with = "de_i64_lenient")]
+    individual_used: Option<i64>,
+    #[serde(default, deserialize_with = "de_i64_lenient")]
+    individual_remaining: Option<i64>,
+    #[serde(default, deserialize_with = "de_i64_lenient")]
+    overall_limit: Option<i64>,
+    #[serde(default, deserialize_with = "de_i64_lenient")]
+    overall_used: Option<i64>,
+    #[serde(default, deserialize_with = "de_i64_lenient")]
+    overall_remaining: Option<i64>,
+}
+
+impl SpendLimitUsage {
+    /// 上限(美分):个人额度优先,回退团队总额度。
+    fn limit_cents(&self) -> Option<i64> {
+        self.individual_limit.or(self.overall_limit)
+    }
+
+    /// 已用超额(美分)。上游给 `used` 就用它;只给 `limit`+`remaining` 时按差值推
+    /// (实测未消费时 `individualUsed` 缺省、`individualRemaining` == `individualLimit`)。
+    fn used_cents(&self) -> i64 {
+        if let Some(u) = self.individual_used.or(self.overall_used) {
+            return u;
+        }
+        match (
+            self.limit_cents(),
+            self.individual_remaining.or(self.overall_remaining),
+        ) {
+            // 差值可能因上游舍入为负,clamp 到 0:超额「已用」不存在负数语义。
+            (Some(l), Some(r)) => (l - r).max(0),
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanUsage {
+    /// 计入套餐限额的已用(美分)。
+    #[serde(default, deserialize_with = "de_i64_lenient")]
+    included_spend: Option<i64>,
+    /// 套餐限额(美分)。
+    #[serde(default, deserialize_with = "de_i64_lenient")]
+    limit: Option<i64>,
+    /// 剩余(美分)。
+    #[serde(default, deserialize_with = "de_i64_lenient")]
+    remaining: Option<i64>,
+    total_percent_used: Option<f64>,
+    /// Cursor 自家模型(Auto/Composer)用量百分比 —— 面板第 1 条用量。
+    auto_percent_used: Option<f64>,
+    /// 第三方前沿模型(claude/gpt)用量百分比 —— 面板第 2 条用量。
+    api_percent_used: Option<f64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `{"consented":true}`(2026-09-12 cur24/cur25 实测响应)。
+    #[test]
+    fn 同意响应_已同意() {
+        assert!(parse_consented(r#"{"consented":true}"#).expect("应解析"));
+    }
+
+    /// `consented` 缺省或 false → 未同意(调用方下周期重试,不假装成功)。
+    #[test]
+    fn 同意响应_未确认视为未同意() {
+        assert!(!parse_consented(r#"{"consented":false}"#).expect("应解析"));
+        assert!(!parse_consented(r"{}").expect("应解析"));
+    }
+
+    /// 非 JSON 必须报错,绝不能当已同意。
+    #[test]
+    fn 同意响应_非_json报错() {
+        assert!(parse_consented("not json").is_err());
+    }
+
+    #[test]
+    fn 解析官方样例_美分换美元() {
+        let body = r#"{
+          "billingCycleStart": "1768399334000",
+          "billingCycleEnd": "1771077734000",
+          "planUsage": {
+            "totalSpend": 23222,
+            "includedSpend": 23222,
+            "bonusSpend": 0,
+            "remaining": 16778,
+            "limit": 40000,
+            "autoPercentUsed": 0,
+            "apiPercentUsed": 46.444,
+            "totalPercentUsed": 58.055
+          },
+          "enabled": true
+        }"#;
+        let q = parse_period_usage(body).expect("应解析");
+        assert!((q.used - 232.22).abs() < 1e-9, "used={}", q.used);
+        assert!((q.limit - 400.0).abs() < 1e-9, "limit={}", q.limit);
+        assert!(
+            (q.remaining - 167.78).abs() < 1e-9,
+            "remaining={}",
+            q.remaining
+        );
+        assert!(q.percent_used > 50.0 && q.percent_used < 60.0);
+        assert!(
+            q.currency.as_deref().is_some_and(|c| c.contains("USD")),
+            "currency={:?}",
+            q.currency
+        );
+        // Cursor 的三条用量里前两条(自家模型 auto / 第三方 api)只给百分比,
+        // 装进 QuotaWindow —— 官方样例 autoPercentUsed=0 / apiPercentUsed=46.444。
+        assert_eq!(q.windows.len(), 2, "windows={:?}", q.windows);
+        assert_eq!(q.windows[0].label, "auto");
+        assert!((q.windows[0].percent_used - 0.0).abs() < 1e-9);
+        assert_eq!(q.windows[1].label, "api");
+        assert!((q.windows[1].percent_used - 46.444).abs() < 1e-9);
+    }
+
+    /// 团队/试用 seat 形态(2026-09-08 bot3/4/5 生产实弹):无 includedSpend,
+    /// 但 remaining+limit 都在 → 已用 = limit - remaining,额度栏不再空白。
+    #[test]
+    fn 无includedSpend但有remaining和limit的seat形态() {
+        let body = r#"{
+          "billingCycleStart": "1786211373000",
+          "billingCycleEnd": "1788889773000",
+          "planUsage": {
+            "remaining": 1500,
+            "limit": 2000,
+            "autoPercentUsed": 0,
+            "apiPercentUsed": 25.0,
+            "totalPercentUsed": 25.0
+          },
+          "enabled": true
+        }"#;
+        let q = parse_period_usage(body).expect("seat 形态应解析");
+        assert!((q.used - 5.0).abs() < 1e-9, "used={}", q.used); // 2000-1500 美分 = $5
+        assert!((q.limit - 20.0).abs() < 1e-9, "limit={}", q.limit);
+        assert!((q.remaining - 15.0).abs() < 1e-9, "remaining={}", q.remaining);
+    }
+
+    /// 上游没给两条百分比时不造窗口(缺省 ≠ 0%),前端据此不渲染空进度条。
+    #[test]
+    fn 缺百分比字段时不造用量窗口() {
+        let body = r#"{"planUsage":{"includedSpend":100,"limit":40000}}"#;
+        let q = parse_period_usage(body).expect("应解析");
+        assert!(q.windows.is_empty(), "windows={:?}", q.windows);
+        // 非法值(负数/NaN)同样不造窗口。
+        let body = r#"{"planUsage":{"includedSpend":100,"limit":40000,"autoPercentUsed":-1.0}}"#;
+        let q = parse_period_usage(body).expect("应解析");
+        assert!(q.windows.is_empty(), "负百分比不该进窗口: {:?}", q.windows);
+    }
+
+    /// Bot 周池:官方实测形态(带毫秒小数的时间戳)→ bot 窗口 + reset_at。
+    #[test]
+    fn 解析_sand_用量_实测样例() {
+        let body = r#"{
+          "currentPeriodStart": "2026-09-05T18:22:04.315Z",
+          "nextResetTimestampUtc": "2026-09-09T05:30:33.460Z",
+          "usagePercent": 32.282705,
+          "hasAvailableUsage": true,
+          "hasNonZeroIncludedLimit": true,
+          "grokPlanLabel": "Grok Bot Plan"
+        }"#;
+        let w = parse_sand_usage(body)
+            .expect("应解析")
+            .expect("有池应出窗口");
+        assert_eq!(w.label, "bot");
+        assert!((w.percent_used - 32.282705).abs() < 1e-9);
+        // 2026-09-09T05:30:33Z = 1788931833(与 format_unix_utc 互逆校验)。
+        assert_eq!(w.reset_at, Some(1_788_931_833), "reset_at={:?}", w.reset_at);
+    }
+
+    /// 无 Bot 池(免费号)/ 缺百分比 / 缺重置时间:都不造窗口或不造时间戳,
+    /// 绝不把「没有」显示成 0%。
+    #[test]
+    fn sand_无池或缺字段不造窗口() {
+        let no_pool = r#"{"usagePercent":0.0,"hasNonZeroIncludedLimit":false}"#;
+        assert_eq!(parse_sand_usage(no_pool).expect("应解析"), None);
+        let no_percent = r#"{"hasNonZeroIncludedLimit":true}"#;
+        assert_eq!(parse_sand_usage(no_percent).expect("应解析"), None);
+        let no_reset = r#"{"usagePercent":12.5}"#;
+        let w = parse_sand_usage(no_reset)
+            .expect("应解析")
+            .expect("有百分比应出窗口");
+        assert_eq!(w.reset_at, None, "没给重置时间不该推算: {:?}", w.reset_at);
+    }
+
+    #[test]
+    fn rfc3339_解析_与_format_unix_utc_互逆() {
+        assert_eq!(parse_rfc3339_unix("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339_unix("2026-06-04T00:00:00Z"), Some(1_780_531_200));
+        // 带毫秒小数的形态(上游实测)。
+        assert_eq!(parse_rfc3339_unix("2026-06-04T00:00:00.999Z"), Some(1_780_531_200));
+        assert_eq!(parse_rfc3339_unix("不是时间"), None);
+    }
+
+    #[test]
+    fn 缺_planUsage_报错() {
+        let err = parse_period_usage("{}").expect_err("空对象应失败");
+        assert!(err.to_string().contains("planUsage"));
+    }
+
+    #[test]
+    fn protobuf_json_的_int64_字符串形态也收() {
+        let body = r#"{
+          "planUsage": {
+            "includedSpend": "23222",
+            "remaining": "16778",
+            "limit": "40000",
+            "totalPercentUsed": 58.055
+          }
+        }"#;
+        let q = parse_period_usage(body).expect("字符串数字应解析");
+        assert!((q.used - 232.22).abs() < 1e-9, "used={}", q.used);
+        assert!((q.limit - 400.0).abs() < 1e-9, "limit={}", q.limit);
+        assert!(
+            (q.remaining - 167.78).abs() < 1e-9,
+            "remaining={}",
+            q.remaining
+        );
+    }
+
+    /// **只缺一个**金额字段 = 上游改了字段/账号状态诡异 → 报错,绝不显示成零额度。
+    /// (两个都缺是 FREE 档的正常形态,见下一个测试。)
+    #[test]
+    fn 只缺一个金额字段报错而不是显示零额度() {
+        for body in [
+            r#"{"planUsage":{"limit":40000,"totalPercentUsed":3.0}}"#,
+            r#"{"planUsage":{"includedSpend":100,"totalPercentUsed":3.0}}"#,
+        ] {
+            let err = parse_period_usage(body).expect_err("只缺一个应失败");
+            assert!(err.to_string().contains("includedSpend"), "{err}");
+        }
+    }
+
+    /// **FREE 档**:上游不给 `includedSpend`/`limit`(免费号没有套餐内额度),
+    /// 只给 `totalSpend`/`bonusSpend` 与百分比。样例取自 2026-08-17 对真号 team1 的实测。
+    ///
+    /// 回归锁:此前这里被当成故障报错 → FREE 号的配额查询整体失败 → 面板额度栏空白、
+    /// 档位也拿不到,只能翻上游原始报文才知道号是被降级了。
+    #[test]
+    fn free档不报错且报出档位() {
+        let body = r#"{
+          "planUsage": {
+            "totalSpend": 100, "bonusSpend": 100, "remainingBonus": 100,
+            "totalPercentUsed": 50, "autoPercentUsed": 100, "apiPercentUsed": 0
+          },
+          "spendLimitUsage": {"pooledLimit":0,"pooledRemaining":0,"individualLimit":0,
+                              "limitType":"user","overallLimit":0,"overallRemaining":0}
+        }"#;
+        let q = parse_period_usage(body).expect("FREE 档不该报错");
+        assert_eq!(q.plan_tier.as_deref(), Some("FREE"));
+        // 免费号的套餐内额度确实是 0(不是"未知")。
+        assert_eq!(q.used, 0.0);
+        assert_eq!(q.limit, 0.0);
+        // 百分比仍要有:limit=0 时走上游给的 totalPercentUsed。
+        assert!(
+            (q.percent_used - 50.0).abs() < 1e-9,
+            "percent={}",
+            q.percent_used
+        );
+        // 两条桶利用率照常承载 —— auto 桶 100% 正是 composer 不可用的直接证据。
+        let auto = q
+            .windows
+            .iter()
+            .find(|w| w.label == "auto")
+            .expect("应有 auto 窗口");
+        assert!((auto.percent_used - 100.0).abs() < 1e-9);
+    }
+
+    /// 付费号必须报 `PAID`(与 FREE 成对,别让两边都落 None)。
+    #[test]
+    fn 付费档报出档位() {
+        let body = r#"{"planUsage":{"includedSpend":23222,"limit":40000,"totalPercentUsed":58.0}}"#;
+        let q = parse_period_usage(body).expect("付费档应解析");
+        assert_eq!(q.plan_tier.as_deref(), Some("PAID"));
+    }
+
+    // ─────────── 超额(on-demand)───────────
+    // 下列样例均来自 2026-08-12 对真号(ultra-test / ultra2)的实测响应。
+
+    /// 未开启超额:上游只回 `{"noUsageBasedAllowed":true}`(ultra2 实测)。
+    #[test]
+    fn 超额未开启() {
+        let od = parse_hard_limit(r#"{"noUsageBasedAllowed":true}"#).expect("应解析");
+        assert!(!od.enabled, "noUsageBasedAllowed=true 即未开启");
+        assert_eq!(od.limit, None);
+        assert!(!od.unlimited);
+    }
+
+    /// 已开启并设了 $75:回读 `{"hardLimit":75}`,**noUsageBasedAllowed 缺省即已开启**。
+    /// 这条是回归闸:若把缺省当 "未开启",面板会把开着的号显示成关的。
+    #[test]
+    fn 超额已开启_缺省字段视为开启() {
+        let od = parse_hard_limit(r#"{"hardLimit":75}"#).expect("应解析");
+        assert!(od.enabled, "字段缺省 = false = 已开启");
+        assert_eq!(od.limit, Some(75.0), "hardLimit 是美元整数,不换算");
+        assert!(!od.unlimited);
+    }
+
+    /// i32 上限 = 客户端的「不限额」档,绝不能当成 $2147483647 的真额度显示。
+    #[test]
+    fn 超额不限额哨兵值() {
+        let od = parse_hard_limit(r#"{"hardLimit":2147483647}"#).expect("应解析");
+        assert!(od.enabled);
+        assert!(od.unlimited, "i32::MAX 应识别为不限额");
+        assert_eq!(od.limit, None, "不限额时不报具体数字");
+    }
+
+    /// 未开启超额时 `spendLimitUsage` 只有 limitType(ultra2 实测)→ 不造 on_demand。
+    #[test]
+    fn 用量响应_未开超额时不报超额() {
+        let body = r#"{
+          "planUsage": {"includedSpend":15158,"limit":40000,"remaining":24842},
+          "spendLimitUsage": {"limitType":"user"}
+        }"#;
+        let q = parse_period_usage(body).expect("应解析");
+        assert!(q.on_demand.is_none(), "只有 limitType 时不该报超额");
+    }
+
+    /// 已开启但零消费(ultra-test 实测):`individualUsed` **缺省**,
+    /// `individualRemaining == individualLimit`。已用应为 0 而非「未知」。
+    #[test]
+    fn 用量响应_开了超额但零消费() {
+        let body = r#"{
+          "planUsage": {"includedSpend":40000,"limit":40000,"bonusSpend":1733},
+          "spendLimitUsage": {"individualLimit":7500,"individualRemaining":7500,"limitType":"user"}
+        }"#;
+        let q = parse_period_usage(body).expect("应解析");
+        let od = q.on_demand.expect("应报超额");
+        assert!(od.enabled);
+        assert_eq!(od.limit, Some(75.0), "7500 美分 = $75");
+        assert_eq!(od.used, 0.0, "零值缺省应视为 0,不是未知");
+    }
+
+    /// 有超额消费:美分换美元,已用按 limit - remaining 推。
+    #[test]
+    fn 用量响应_有超额消费() {
+        let body = r#"{
+          "planUsage": {"includedSpend":40000,"limit":40000},
+          "spendLimitUsage": {"individualLimit":7500,"individualRemaining":5250,"limitType":"user"}
+        }"#;
+        let q = parse_period_usage(body).expect("应解析");
+        let od = q.on_demand.expect("应报超额");
+        assert!((od.used - 22.5).abs() < 1e-9, "used={} 应为 $22.5", od.used);
+        assert_eq!(od.limit, Some(75.0));
+    }
+
+    /// 上游直接给 `individualUsed` 时以它为准(优先于差值推算)。
+    #[test]
+    fn 用量响应_优先用服务端已用值() {
+        let body = r#"{
+          "planUsage": {"includedSpend":40000,"limit":40000},
+          "spendLimitUsage": {"individualLimit":7500,"individualUsed":1234,"individualRemaining":6266,"limitType":"user"}
+        }"#;
+        let q = parse_period_usage(body).expect("应解析");
+        let od = q.on_demand.expect("应报超额");
+        assert!((od.used - 12.34).abs() < 1e-9, "used={}", od.used);
+    }
+
+    /// 团队号只给 overall_*:应回退取用,不能因为没有 individual_* 就当无超额。
+    #[test]
+    fn 用量响应_团队号回退_overall() {
+        let body = r#"{
+          "planUsage": {"includedSpend":40000,"limit":40000},
+          "spendLimitUsage": {"overallLimit":20000,"overallUsed":4500,"limitType":"team"}
+        }"#;
+        let q = parse_period_usage(body).expect("应解析");
+        let od = q.on_demand.expect("应报超额");
+        assert_eq!(od.limit, Some(200.0));
+        assert!((od.used - 45.0).abs() < 1e-9, "used={}", od.used);
+    }
+
+    /// 未绑支付方式时上游的 `message` 恒为 "Error",真正原因在 details 里 —— 必须抽出来,
+    /// 否则运维在面板上只看到一个 "Error"(ultra2 实测响应)。
+    #[test]
+    fn 错误详情从_details_里抽出() {
+        let body = r#"{"code":"failed_precondition","message":"Error","details":[{"type":"aiserver.v1.ErrorDetails","debug":{"error":"ERROR_BAD_REQUEST","details":{"title":"Payment method required","detail":"We need to collect a payment method before enabling on-demand.","isRetryable":false}}}]}"#;
+        let d = extract_error_detail(body).expect("应抽出详情");
+        assert!(d.contains("Payment method required"), "d={d}");
+        assert!(d.contains("collect a payment method"), "d={d}");
+    }
+
+    /// 非 Connect 错误体(纯文本/别的 JSON)不该 panic,回 None 让调用方退回原文。
+    #[test]
+    fn 错误详情_无_details_时回_none() {
+        assert!(extract_error_detail("not json").is_none());
+        assert!(extract_error_detail(r#"{"message":"boom"}"#).is_none());
+    }
+}

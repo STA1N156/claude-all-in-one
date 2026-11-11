@@ -1,0 +1,10 @@
+{
+  "name": "dario-supervisor",
+  "private": true,
+  "type": "module",
+  "description": "caio 侧车：每个 Claude OAuth 号一个原版 dario 进程（按需启动 / 闲置停止）",
+  "scripts": {
+    "start": "bun src/main.ts",
+    "test": "bun test"
+  }
+}

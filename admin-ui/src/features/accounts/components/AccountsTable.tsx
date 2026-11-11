@@ -1,0 +1,155 @@
+import { Users } from 'lucide-react'
+
+import { Badge } from '@/components/ui/badge'
+import { Card } from '@/components/ui/card'
+import { Skeleton } from '@/components/ui/skeleton'
+import { Table, TBody, TD, TH, THead, TR } from '@/components/ui/table'
+import { useI18n } from '@/lib/i18n'
+
+import type { QuotaKind } from '../lib'
+import type { AccountRow, AccountRuntimeEntry } from '../types'
+import { AccountTableRow, type RuntimeQueryState } from './AccountTableRow'
+
+interface AccountsTableProps {
+  data: AccountRow[] | undefined
+  loading: boolean
+  /** account_id -> 运行态（mergeRuntimeByAccount 的结果）。 */
+  runtimeByAccount: Map<string, AccountRuntimeEntry>
+  runtimeState: RuntimeQueryState
+  /** 分组名 -> 颜色（来自 /groups），分组列上色用。 */
+  groupColors: Map<string, string>
+  /** 配额列口径:'credits'=积分(Kiro);'windows'=5h/7d 利用率(ccmax/dario)。决定列头与单元格渲染。 */
+  quotaKind: QuotaKind
+  /** 是否显示超额（on-demand）列 —— 仅支持的 provider（Cursor）为 true。 */
+  showOnDemand: boolean
+  /** account_id -> 全时段日志累计积分(积分对账);undefined = 尚未查到。 */
+  loggedCreditsByAccount: Map<string, number> | undefined
+  /** 当前有 mutation 进行中的 account_id（仅该行操作置灰）。 */
+  busyId: string | null
+  onToggleDisabled: (row: AccountRow) => void
+  onEdit: (row: AccountRow) => void
+  onDelete: (id: string) => void
+  onReset: (id: string) => void
+  onRefresh: (id: string) => void
+  onViewModels: (row: AccountRow) => void
+  /** 打开超额额度设置弹窗。 */
+  onEditOnDemand: (row: AccountRow) => void
+}
+
+/** 账号列表玻璃卡表格：配置行 + worker 运行态的 merge 视图。 */
+export function AccountsTable({
+  data,
+  loading,
+  runtimeByAccount,
+  runtimeState,
+  groupColors,
+  quotaKind,
+  showOnDemand,
+  loggedCreditsByAccount,
+  busyId,
+  onToggleDisabled,
+  onEdit,
+  onDelete,
+  onReset,
+  onRefresh,
+  onViewModels,
+  onEditOnDemand,
+}: AccountsTableProps) {
+  const { t } = useI18n()
+
+  const columns = [
+    { label: t('table.accountId') },
+    { label: t('table.group') },
+    { label: t('table.provider') },
+    { label: t('table.status') },
+    // 配额列头随口径切换:积分/美元(Kiro·Cursor) ↔ 限额 5h/7d(ccmax/dario) ↔ 通用「限额」。
+    {
+      label:
+        quotaKind === 'windows'
+          ? t('table.quotaWindows')
+          : quotaKind === 'credits'
+            ? t('table.credits')
+            : t('table.quota'),
+      right: true,
+    },
+    // 超额列只在支持的 provider(目前仅 Cursor)出现:别的 provider 没这概念,
+    // 常驻一列全是「—」纯属噪音。
+    ...(showOnDemand ? [{ label: t('table.onDemand'), right: true }] : []),
+    { label: t('table.concurrency'), right: true },
+    { label: t('table.rpm'), right: true },
+    { label: t('table.queue'), right: true },
+    { label: t('table.priority'), right: true },
+    { label: t('table.failures'), right: true },
+    { label: t('table.totalSuccessFail'), right: true },
+    { label: t('table.actions'), right: true },
+  ]
+
+  const rows = data ?? []
+
+  return (
+    <Card className="overflow-hidden">
+      <div className="flex items-center justify-between border-b border-black/5 px-5 py-4 dark:border-white/5">
+        <div className="flex items-center gap-2">
+          <Users className="h-4 w-4 text-primary" />
+          <h2 className="text-sm font-semibold">{t('accounts.listTitle')}</h2>
+        </div>
+        {!loading && <Badge variant="muted">{rows.length}</Badge>}
+      </div>
+      <Table>
+        <THead>
+          <tr>
+            {columns.map((column) => (
+              <TH key={column.label} className={column.right ? 'text-right' : undefined}>
+                {column.label}
+              </TH>
+            ))}
+          </tr>
+        </THead>
+        <TBody>
+          {loading ? (
+            Array.from({ length: 3 }, (_, rowIndex) => (
+              <TR key={rowIndex}>
+                {columns.map((column) => (
+                  <TD key={column.label}>
+                    <Skeleton className={column.right ? 'ml-auto h-4 w-14' : 'h-4 w-20'} />
+                  </TD>
+                ))}
+              </TR>
+            ))
+          ) : rows.length === 0 ? (
+            <tr>
+              <TD colSpan={columns.length} className="py-10 text-center text-muted-foreground">
+                {t('accounts.empty')}
+              </TD>
+            </tr>
+          ) : (
+            rows.map((row) => (
+              <AccountTableRow
+                key={row.account_id}
+                row={row}
+                runtime={runtimeByAccount.get(row.account_id)}
+                runtimeState={runtimeState}
+                groupColors={groupColors}
+                quotaKind={quotaKind}
+                showOnDemand={showOnDemand}
+                loggedCredits={
+                  loggedCreditsByAccount === undefined || row.provider !== 'kiro'
+                    ? undefined
+                    : (loggedCreditsByAccount.get(row.account_id) ?? 0)
+                }
+                busy={busyId === row.account_id}
+                onToggleDisabled={onToggleDisabled}
+                onEdit={onEdit}
+                onDelete={onDelete}
+                onReset={onReset}
+                onRefresh={onRefresh}
+                onViewModels={onViewModels}
+                onEditOnDemand={onEditOnDemand}
+              />
+            ))
+          )}
+        </TBody>
+      </Table>
+    </Card>
+  )
+}
