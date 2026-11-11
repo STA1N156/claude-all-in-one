@@ -657,6 +657,9 @@ impl AdminConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheConfig {
+    /// 本地前缀缓存命中统计开关。
+    #[serde(default = "default_cache_enabled")]
+    pub enabled: bool,
     pub read_multiplier: f64,
     pub cap_ratio: f64,
     pub floor_ratio: f64,
@@ -1334,9 +1337,14 @@ pub const DEFAULT_CACHE_READ_MULTIPLIER: f64 = 1.0;
 pub const DEFAULT_CACHE_CAP_RATIO: f64 = 0.9;
 pub const DEFAULT_CACHE_FLOOR_RATIO: f64 = 0.1;
 
+fn default_cache_enabled() -> bool {
+    true
+}
+
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             read_multiplier: DEFAULT_CACHE_READ_MULTIPLIER,
             cap_ratio: DEFAULT_CACHE_CAP_RATIO,
             floor_ratio: DEFAULT_CACHE_FLOOR_RATIO,
@@ -1393,6 +1401,8 @@ pub struct SystemSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_pool: Option<Vec<String>>,
     // —— cache ——
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_multiplier: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1644,6 +1654,7 @@ impl SystemSettings {
 impl SystemSettings {
     /// 把非 None 字段叠加到 `base`(原地)。`default_proxy` 不属 SystemConfig,不在此处理。
     pub fn apply_to(&self, base: &mut SystemConfig) {
+        if let Some(v) = self.cache_enabled { base.cache.enabled = v; }
         if let Some(v) = self.cache_read_multiplier { base.cache.read_multiplier = v; }
         if let Some(v) = self.cache_cap_ratio { base.cache.cap_ratio = v; }
         if let Some(v) = self.cache_floor_ratio { base.cache.floor_ratio = v; }
@@ -1795,6 +1806,7 @@ impl SystemSettings {
             // egress_pool 不属 SystemConfig(同 default_proxy);from_effective 不重建它,
             // 调用方(settings::effective)从 overlay 原样回灌。
             egress_pool: None,
+            cache_enabled: Some(cfg.cache.enabled),
             cache_read_multiplier: Some(cfg.cache.read_multiplier),
             cache_cap_ratio: Some(cfg.cache.cap_ratio),
             cache_floor_ratio: Some(cfg.cache.floor_ratio),

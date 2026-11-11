@@ -68,6 +68,7 @@ interface FormState {
   default_proxy: string
   /** 出口池:文本框,每行一个代理 URL(提交时拆分成数组)。 */
   egress_pool: string
+  cache_enabled: boolean
   cache_read_multiplier: string
   cache_cap_ratio: string
   cache_floor_ratio: string
@@ -120,6 +121,7 @@ function settingsToForm(s: SystemSettings): FormState {
   return {
     default_proxy: s.default_proxy ?? '',
     egress_pool: (s.egress_pool ?? []).join('\n'),
+    cache_enabled: s.cache_enabled ?? true,
     cache_read_multiplier: String(s.cache_read_multiplier),
     cache_cap_ratio: String(s.cache_cap_ratio),
     cache_floor_ratio: String(s.cache_floor_ratio),
@@ -232,6 +234,7 @@ function buildPatch(form: FormState, original: SystemSettings): SystemSettingsPa
 
   // 布尔字段
   const boolFields: Array<keyof SystemSettings & keyof FormState> = [
+    'cache_enabled',
     'quota_poll_enabled',
     'image_enabled',
     'tools_in_prefix',
@@ -549,6 +552,21 @@ export default function SettingsPage() {
             <CardTitle className="text-base">{t('settings.section.cache')}</CardTitle>
           </CardHeader>
           <CardContent className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <label className="flex cursor-pointer items-start gap-3 sm:col-span-2 lg:col-span-3">
+              <input
+                type="checkbox"
+                checked={form?.cache_enabled ?? true}
+                onChange={(e) => set('cache_enabled', e.target.checked)}
+                disabled={isLoading || form === null}
+                className="mt-0.5 h-4 w-4 rounded"
+              />
+              <span>
+                <span className="block text-sm font-medium">{t('settings.field.cacheEnabled')}</span>
+                <span className="block text-xs text-muted-foreground">
+                  {t('settings.field.cacheEnabledHint')}
+                </span>
+              </span>
+            </label>
             <div className="space-y-1.5">
               <label className="text-xs font-medium text-muted-foreground">
                 {t('settings.field.cacheReadMultiplier')}

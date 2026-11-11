@@ -105,21 +105,14 @@ flowchart BT
 | `/admin/api/*` | router | accounts / groups / keys / usage / import / reset(admin token 鉴权) |
 | `GET /health` | both | worker 版含各账号运行态 + 配额缓存 |
 
-## 运行
+## Zeabur 一键部署
 
-```bash
-# 配置:复制 example 并填写(真实配置已 gitignore)
-cp config/system.example.yaml config/system.yaml
-cp config/instances.example.yaml config/instances.yaml
+1. Zeabur 新建项目,选择 **GitHub → 部署此仓库**。
+2. 保持默认设置,Zeabur 会自动使用根目录 `Dockerfile`,只需把 HTTP 端口设为 `8080`。
+3. 部署完成后打开 `https://你的域名/admin`。默认密码是 `123456`。
+4. 登录后先添加 Kiro 账号,再创建客户端密钥即可使用 `/v1/messages`。
 
-cargo build --release
-./target/release/claude-all-in-one --mode router
-./target/release/claude-all-in-one --mode worker --instance 0
-```
-
-前端开发:`cd admin-ui && bun install && bun run build`(产物内嵌进 router 二进制)。
-
-测试:`cargo test --workspace`。
+如需修改管理密码,在 Zeabur 添加环境变量 `ADMIN_TOKEN` 并重新部署。建议给服务挂载一个持久化卷到 `/app/data`,用于保留账号、密钥和统计;不挂载也能运行,但重新部署后数据会清空。
 
 ## 演进记录
 

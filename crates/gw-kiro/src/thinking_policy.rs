@@ -8,7 +8,8 @@
 //!   跳过 thinking 注入(隐藏工具方案要模型只调工具,与推理流冲突,强开会让结构化输出失效)。
 //! - **Opus 全系(4.6/4.7/4.8 及后续)默认 adaptive + effort,无需 `-thinking` 后缀**:
 //!   客户端已显式配 thinking 则尊重;否则 effort 用 output_config.effort 缺省 "high"。
-//! - **非 Opus 但模型名含 `-thinking` 后缀**(sonnet/haiku 等):enabled + 固定 budget。
+//! - **非 Opus 但模型名带 `-thinking` 或 `-reasoning` 后缀**(sonnet/haiku 等):
+//!   enabled + 固定 budget。
 //! - 其余:不动。
 //!
 //! 历史教训(kiro.rs 注释):旧实现要求模型名必含 "thinking" 且 adaptive 硬编码仅 opus-4.6,
@@ -228,7 +229,7 @@ pub fn wire_additional_model_request_fields(
 pub fn override_thinking_from_model_name(req: &mut MessagesRequest) {
     let model_lower = req.model.to_lowercase();
     let is_opus = model_lower.contains("opus");
-    let has_thinking_suffix = model_lower.contains("thinking");
+    let has_thinking_suffix = crate::converter::has_thinking_suffix(&model_lower);
 
     // 结构化输出(json_schema)与 thinking 互斥:客户端要 json_schema 且未显式带 thinking → 不强开。
     let wants_structured_output = req
@@ -287,11 +288,11 @@ pub fn override_thinking_from_model_name(req: &mut MessagesRequest) {
             format: None,
         });
     } else if has_thinking_suffix {
-        // 非 Opus 但带 -thinking 后缀:enabled + 固定 budget。
+        // 非 Opus 但带 -thinking / -reasoning 后缀:enabled + 固定 budget。
         tracing::info!(
             model = %req.model,
             thinking_type = "enabled",
-            "非 Opus 模型名含 thinking 后缀，覆写为 enabled"
+            "非 Opus 模型名带 Thinking 后缀，覆写为 enabled"
         );
         req.thinking = Some(Thinking {
             thinking_type: "enabled".to_string(),
@@ -381,6 +382,13 @@ mod tests {
     #[test]
     fn non_opus_with_thinking_suffix_enabled() {
         let mut r = req("claude-sonnet-4-5-thinking", None, None);
+        override_thinking_from_model_name(&mut r);
+        assert_eq!(r.thinking.unwrap().thinking_type, "enabled");
+    }
+
+    #[test]
+    fn non_opus_with_reasoning_suffix_enabled() {
+        let mut r = req("claude-sonnet-4-5-reasoning", None, None);
         override_thinking_from_model_name(&mut r);
         assert_eq!(r.thinking.unwrap().thinking_type, "enabled");
     }

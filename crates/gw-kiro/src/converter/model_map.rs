@@ -5,8 +5,8 @@
 //! (`normalize::requested_model_identity`)、窗口推导(`get_context_window_size`)**全部从此表派生**,
 //! 杜绝历史上"四处列表不一致 → 公告了 chat 却 None / 真实代号泄漏"的漂移。
 //!
-//! 四种对外形态由 [`resolve_base`] 统一归一到基础行:plain / `-thinking` / 日期 /
-//! 日期`-thinking`。
+//! 对外形态由 [`resolve_base`] 统一归一到基础行:plain、`-thinking` / `-reasoning`
+//! 后缀、日期别名及其对应后缀变体。
 
 use crate::text_tokens::Tokenizer;
 
@@ -620,12 +620,28 @@ fn strip_date_suffix(id: &str) -> &str {
     }
 }
 
-/// 把对外请求名(plain / `-thinking` / 日期 / 日期`-thinking`)归一到权威表的基础行。
-/// 顺序:先剥 `-thinking`,再剥日期,最后对 `advertised_id` 精确匹配。
+/// 对外模型名是否通过任一 Thinking 后缀显式请求思考。
+pub(super) fn strip_thinking_suffix(model: &str) -> &str {
+    for suffix in ["-reasoning", "-thinking"] {
+        if model.len() >= suffix.len()
+            && model[model.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        {
+            return &model[..model.len() - suffix.len()];
+        }
+    }
+    model
+}
+
+pub fn has_thinking_suffix(model: &str) -> bool {
+    strip_thinking_suffix(model).len() != model.len()
+}
+
+/// 把对外请求名(plain / `-thinking` / `-reasoning` / 日期变体)归一到权威表基础行。
+/// 顺序:先剥 Thinking 后缀,再剥日期,最后对 `advertised_id` 精确匹配。
 pub fn resolve_base(requested: &str) -> Option<&'static KiroModel> {
-    let lower = requested.to_lowercase();
-    let no_thinking = lower.strip_suffix("-thinking").unwrap_or(&lower);
-    let base = strip_date_suffix(no_thinking);
+    let no_thinking = strip_thinking_suffix(requested);
+    let lower = no_thinking.to_lowercase();
+    let base = strip_date_suffix(&lower);
     all_models().find(|m| m.advertised_id == base)
 }
 
@@ -742,7 +758,7 @@ pub fn tokenizer_for_kiro_model(kiro_model: &str) -> Tokenizer {
         .map_or(Tokenizer::Current, |m| m.tokenizer)
 }
 
-/// 对外公告的一个模型条目(由权威表展开:plain / -thinking / 日期 / 日期-thinking)。
+/// 对外公告的一个模型条目(由权威表展开:基础版 + 两种 Thinking 后缀 + 日期变体)。
 pub struct AdvertisedModel {
     pub id: String,
     pub display_name: String,
@@ -750,23 +766,22 @@ pub struct AdvertisedModel {
 }
 
 /// 从权威表生成 `/v1/models` 完整对外目录。每个基础模型展开:
-/// plain、`-thinking`;若有 dated_alias 再加 日期名、`日期名-thinking`。
+/// 每个名字生成基础版、`-thinking`、`-reasoning`;有 dated_alias 时再展开日期名。
 pub fn advertised_models() -> Vec<AdvertisedModel> {
-    let mut out = Vec::with_capacity(KIRO_MODELS.len() * 4);
+    let mut out = Vec::with_capacity(KIRO_MODELS.len() * 6);
     for m in all_models() {
-        // plain
         out.push(AdvertisedModel {
             id: m.advertised_id.to_string(),
             display_name: m.display_name.to_string(),
             supports_thinking: m.supports_thinking,
         });
-        // -thinking(thinking 变体恒声明 supports_thinking=true)
-        out.push(AdvertisedModel {
-            id: format!("{}-thinking", m.advertised_id),
-            display_name: format!("{} (thinking)", m.display_name),
-            supports_thinking: true,
-        });
-        // 日期别名 + 日期-thinking
+        for suffix in ["-thinking", "-reasoning"] {
+            out.push(AdvertisedModel {
+                id: format!("{}{suffix}", m.advertised_id),
+                display_name: format!("{} ({})", m.display_name, &suffix[1..]),
+                supports_thinking: true,
+            });
+        }
         if let Some(dated) = m.dated_alias {
             let date_label = dated_label(dated);
             out.push(AdvertisedModel {
@@ -774,11 +789,13 @@ pub fn advertised_models() -> Vec<AdvertisedModel> {
                 display_name: format!("{}{date_label}", m.display_name),
                 supports_thinking: m.supports_thinking,
             });
-            out.push(AdvertisedModel {
-                id: format!("{dated}-thinking"),
-                display_name: format!("{} (thinking){date_label}", m.display_name),
-                supports_thinking: true,
-            });
+            for suffix in ["-thinking", "-reasoning"] {
+                out.push(AdvertisedModel {
+                    id: format!("{dated}{suffix}"),
+                    display_name: format!("{} ({}){date_label}", m.display_name, &suffix[1..]),
+                    supports_thinking: true,
+                });
+            }
         }
     }
     out
@@ -859,26 +876,28 @@ mod tests {
     }
 
     #[test]
-    fn advertised_includes_thinking_and_dated() {
+    fn advertised_includes_thinking_reasoning_and_dated() {
         // 热追加是进程全局状态:与改它的测试串行,条数才对得上。
         let _g = super::super::extra_models::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ids: Vec<String> = advertised_models().into_iter().map(|m| m.id).collect();
         assert!(ids.contains(&"claude-opus-4-8".to_string()));
         assert!(ids.contains(&"claude-opus-4-8-thinking".to_string()));
+        assert!(ids.contains(&"claude-opus-4-8-reasoning".to_string()));
         assert!(ids.contains(&"claude-sonnet-4-5-20250929".to_string()));
         assert!(ids.contains(&"claude-sonnet-4-5-20250929-thinking".to_string()));
         assert!(ids.contains(&"claude-haiku-4-5-20251001".to_string()));
-        // 展开数从表派生(有 dated_alias=4 形态,否则 2),而非硬钉常量——
+        // 展开数从表派生(有 dated_alias=6 形态,否则 3),而非硬钉常量——
         // 加/减模型或日期别名时测试仍校验"展开逻辑"而非快照(审查 Minimalist#3)。
         let expected: usize = all_models()
-            .map(|m| if m.dated_alias.is_some() { 4 } else { 2 })
+            .map(|m| if m.dated_alias.is_some() { 6 } else { 3 })
             .sum();
         assert_eq!(ids.len(), expected);
     }
 
     #[test]
-    fn map_model_resolves_thinking_and_dated() {
+    fn map_model_resolves_thinking_reasoning_and_dated() {
         assert_eq!(map_model("claude-opus-4-8-thinking").as_deref(), Some("claude-opus-4.8"));
+        assert_eq!(map_model("claude-opus-4-8-reasoning").as_deref(), Some("claude-opus-4.8"));
         assert_eq!(
             map_model("claude-opus-4-5-20251101-thinking").as_deref(),
             Some("claude-opus-4.5")
@@ -1296,13 +1315,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_base_handles_all_four_forms() {
+    fn resolve_base_handles_both_thinking_aliases_and_dates() {
         let want = "claude-sonnet-4-5";
         for form in [
             "claude-sonnet-4-5",
             "claude-sonnet-4-5-thinking",
+            "claude-sonnet-4-5-reasoning",
             "claude-sonnet-4-5-20250929",
             "claude-sonnet-4-5-20250929-thinking",
+            "claude-sonnet-4-5-20250929-reasoning",
         ] {
             assert_eq!(resolve_base(form).map(|m| m.advertised_id), Some(want), "{form}");
         }

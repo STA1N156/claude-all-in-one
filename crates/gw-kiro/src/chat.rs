@@ -210,24 +210,11 @@ fn strip_reasoning_from_history(req: &mut KiroRequest) -> bool {
     stripped
 }
 
-/// 用**真正发出去**的 conversation_state 观测一次 prefix 缓存模拟器(并把本轮指纹存为下一轮基准)。
-///
-/// session_key 必须按**账号**隔离:一个 worker 固定一组多账号,真实 Kiro prefix cache 是
-/// per-account 隔离的。若两账号撞同一派生 conversationId(同 system + 前 2 条 user),只用
-/// convId 作键会让 A 账号的前缀污染 B 账号的命中估算 → 误报折扣/串号计费。
-/// 故 key = account_id + '\x1f' + conversationId,与上游缓存粒度对齐。
-fn observe_sim(account_id: &str, kiro_req: &KiroRequest, model: &str) -> SimResult {
-    let cs = &kiro_req.conversation_state;
-    let session_key = format!("{}\x1f{}", account_id, cs.conversation_id);
-    let fps = crate::cache_sim::fingerprints_from_state(cs);
-    crate::cache_sim::observe(&session_key, model, fps)
-}
-
 pub async fn chat_stream(
     client: reqwest::Client,
     account: Arc<Account>,
     machine_id: String,
-    req: ChatRequest,
+    mut req: ChatRequest,
     cache_policy: CachePolicy,
     max_body_bytes: usize,
 ) -> Result<ChatStream, UpstreamError> {
@@ -240,8 +227,15 @@ pub async fn chat_stream(
             })?;
 
     // 1.5 块2a:按模型名覆写 thinking 配置(Opus 全系默认开 adaptive 保智力;
-    // 非 Opus -thinking 后缀 enabled;结构化输出与 thinking 互斥)。🔵 kiro.rs 稳定经验。
+    // 非 Opus 的 -thinking/-reasoning 后缀 enabled;结构化输出与 thinking 互斥)。🔵 kiro.rs 稳定经验。
     crate::thinking_policy::override_thinking_from_model_name(&mut messages_req);
+    let sim_total = crate::text_tokens::count_request_tokens(&req.body)
+        .min(u32::MAX as u64) as u32;
+    let cache_profile = crate::cache_sim::begin_claude_profile(
+        std::mem::take(&mut req.body),
+        &req.model,
+        cache_policy.cap_ratio,
+    );
 
     // 端点按账号选(extra.kiro_endpoint:缺省跟全局开关 → runtime REST;`q` → 老端点 RPC 形态;
     // `responses` → /v1/responses,IDE 1.4.121 形态)。报文形态决定后面的转换与序列化,所以先定。
@@ -301,11 +295,10 @@ pub async fn chat_stream(
         serialize_for_wire(r, responses)
     })?;
 
-    // 3.6 Prefix 缓存命中模拟(见 [`observe_sim`])。🔵 对齐 kiro.rs。
-    // **必须在体积护栏之后**观测(审查 Architect#2):护栏剔除历史媒体后,这里观测的是
-    // **真正发给上游的** conversation_state,否则会按未剔除口径高估 input/cache_read tokens
-    // 落库计费,且把从未发出的前缀写进模拟缓存状态污染后续轮。
-    let mut sim = observe_sim(&account.account_id, &kiro_req, &req.model);
+    let sim = SimResult {
+        cache_read_tokens: 0,
+        total_tokens: sim_total,
+    };
 
     // 3.7 毒报文备忘录(🔵 kiro.rs v63):同字节级 payload 近期已在**多个不同账号**上被上游
     // 确定性 400 过 → 本地 BadRequest 拦截,不再打上游。兜住无视 400 仍重试的客户端。
@@ -403,11 +396,6 @@ pub async fn chat_stream(
             })?;
             let status2 = resp2.status();
             if status2.is_success() {
-                // codex 审查:首次观测提交的是**带 reasoning** 的指纹,而实际被上游接受的
-                // 是剥离后的报文 —— 用剥离后的 state 重新观测一次,让本轮计费与缓存状态
-                // 都反映真实发出的字节(observe 同 key 覆盖旧状态,且与上游真实缓存的
-                // 前缀形态一致:上游记住的也是剥离版)。
-                sim = observe_sim(&account.account_id, &kiro_req, &req.model);
                 resp = resp2;
             } else {
                 let body2 = resp2.text().await.unwrap_or_default();
@@ -442,6 +430,8 @@ pub async fn chat_stream(
     let byte_stream = resp.bytes_stream();
     let billing = BillingCtx {
         sim,
+        cache_profile,
+        cache_managed: true,
         policy: cache_policy,
         kiro_model: kiro_req
             .conversation_state
@@ -2159,6 +2149,8 @@ mod tests {
                     cache_read_tokens: 0,
                     total_tokens: 100,
                 },
+                cache_profile: None,
+                cache_managed: false,
                 policy,
                 kiro_model: "claude-opus-4.8".into(),
                 enterprise: false,
@@ -2184,6 +2176,8 @@ mod tests {
                     cache_read_tokens: 0,
                     total_tokens: 100,
                 },
+                cache_profile: None,
+                cache_managed: false,
                 policy: CachePolicy::default(),
                 kiro_model: "claude-opus-5.5".into(),
                 enterprise: false,

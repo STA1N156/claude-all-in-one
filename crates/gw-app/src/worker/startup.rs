@@ -51,6 +51,11 @@ pub async fn run(
             None
         }
     };
+    let prompt_cache_path = db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("data"))
+        .join("prompt-cache.bin");
+    gw_kiro::cache_sim::configure_persistence(prompt_cache_path);
 
     // 首启播种:yaml → DB 幂等导入(已有行不覆盖,绝不回滚已 roll 的 token)。
     if let (Some(store), Some(cfg)) = (&store, &accounts_cfg) {

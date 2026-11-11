@@ -38,7 +38,7 @@ mod tools;
 // 重导出子模块项,使本文件(及测试)无需逐一限定路径即可调用。
 pub use model_map::{
     advertised_models, clamp_effort_for_model, denies_free, effort_drift, effort_schema_for,
-    get_context_window_size, map_model, requires_structured_effort, resolve_base,
+    get_context_window_size, has_thinking_suffix, map_model, requires_structured_effort, resolve_base,
     routes_to_anthropic, signature_id_for, tokenizer_for_kiro_model, AdvertisedModel,
     EffortDrift, EffortSchema, SignatureId,
 };

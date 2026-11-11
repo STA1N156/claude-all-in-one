@@ -1,5 +1,5 @@
 # 多阶段构建:bun 建前端 → 嵌进二进制 → rust release → slim 运行时。
-# 单二进制 claude-all-in-one,按 --mode router|worker 复用同一镜像。
+# 单二进制 claude-all-in-one;默认单容器同时运行 router 与 worker。
 
 # --- 1. 前端:admin-ui/dist(供 embed-ui 内嵌) ---
 FROM oven/bun:1 AS frontend
@@ -47,5 +47,11 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=builder /app/target/release/claude-all-in-one /usr/local/bin/claude-all-in-one
 COPY --from=cursorcli /opt/cursor-agent /opt/cursor-agent
+COPY config/zeabur.instances.yaml /app/config/instances.yaml
+COPY config/zeabur.system.yaml /app/config/system.yaml
+COPY config/zeabur.accounts.yaml /app/config/accounts.yaml
+RUN mkdir -p /app/data
 # config/(只读)与 data/(SQLite)运行时挂载;默认路径相对 CWD=/app。
 ENTRYPOINT ["claude-all-in-one"]
+CMD ["--mode", "all"]
+EXPOSE 8080

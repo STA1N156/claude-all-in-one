@@ -10,6 +10,8 @@ export interface SystemSettings {
   default_proxy: string | null
   /** 出口代理池（美国多 IP）：导入/新建账号时按最少使用自动分配粘性出口。null/空 = 不自动分配。 */
   egress_pool: string[] | null
+  /** 本地前缀缓存命中统计开关。 */
+  cache_enabled?: boolean
   /** 缓存读取倍率（浮点）。 */
   cache_read_multiplier: number
   /** 缓存上限比例（浮点）。 */

@@ -29,19 +29,19 @@ pub(super) fn strip_rolling_fingerprints(s: &str) -> String {
 
 /// 由客户端请求的 model 名给出 (短名, 回显 model_id)。未知模型返回 None(不改写)。
 ///
-/// 走权威表 [`super::model_map::resolve_base`](统一归一 plain/-thinking/日期/日期-thinking):
+/// 走权威表 [`super::model_map::resolve_base`](统一归一 plain/Thinking 后缀/日期):
 /// - `short` 取该基础行的 `identity_short`(防 Kiro 真实代号 `claude-quince` 泄漏);
-/// - 回显的 model_id 取**去 `-thinking` 后的原请求名**,从而**保留日期名**
+/// - 回显的 model_id 取**去 Thinking 后缀后的原请求名**,从而**保留日期名**
 ///   (如 `claude-sonnet-4-5-20250929`),让身份行与甲方请求名一致。
 ///
 /// 历史 bug:旧实现对去 thinking 后的名字做精确匹配,日期快照名(`...-20250929`)匹配不上
 /// → 返回 None → 身份行不规范化 → claude-quince 泄漏。改走 resolve_base 后日期名也覆盖。
 fn requested_model_identity(model: &str) -> Option<(&'static str, String)> {
-    // 1. 权威表精确归一(plain/-thinking/日期/日期-thinking):回显去 thinking 的原请求名
+    // 1. 权威表精确归一:回显去 Thinking 后缀的原请求名
     //    (保留日期段)。去后缀**大小写不敏感**——resolve_base 小写匹配,回显也须一致剥除,
     //    否则 `...-THINKING` 会把后缀漏在身份行里(审查 Skeptic#3/Minimalist#4)。
     if let Some(base) = super::model_map::resolve_base(model) {
-        let echo = strip_thinking_suffix_ci(model);
+        let echo = super::model_map::strip_thinking_suffix(model);
         return Some((base.identity_short, echo.to_string()));
     }
     // 2. 兜底:凡 `map_model` 能路由的名字(子串兜底的异名/未列名)身份保护面也必须覆盖,
@@ -50,16 +50,6 @@ fn requested_model_identity(model: &str) -> Option<(&'static str, String)> {
     let kiro = super::model_map::map_model(model)?;
     let base = super::model_map::all_models().find(|m| m.kiro_model == kiro)?;
     Some((base.identity_short, base.advertised_id.to_string()))
-}
-
-/// 大小写不敏感地剥掉末尾 `-thinking`(9 字符)。
-fn strip_thinking_suffix_ci(s: &str) -> &str {
-    const SUFFIX: &str = "-thinking";
-    if s.len() >= SUFFIX.len() && s[s.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX) {
-        &s[..s.len() - SUFFIX.len()]
-    } else {
-        s
-    }
 }
 
 /// 规范化 system 文本里的 model identity 行,统一成
@@ -109,7 +99,7 @@ pub(super) fn normalize_model_identity(content: String, model: &str) -> String {
 mod tests {
     use super::*;
 
-    /// 不变量:每个**公告**对外名(含 -thinking / 日期 / 日期-thinking)都必须能身份规范化,
+    /// 不变量:每个**公告**对外名(含两种 Thinking 后缀和日期变体)都必须能身份规范化,
     /// 否则 /v1/models 公告了一个会泄漏 Kiro 真实代号(claude-quince)的模型(审查 Minimalist#4)。
     #[test]
     fn every_advertised_model_normalizes_identity() {
@@ -131,6 +121,8 @@ mod tests {
         // 日期 + thinking:去 thinking 后回显日期名。
         let (_, echo2) = requested_model_identity("claude-sonnet-4-5-20250929-thinking").unwrap();
         assert_eq!(echo2, "claude-sonnet-4-5-20250929");
+        let (_, echo3) = requested_model_identity("claude-sonnet-4-5-20250929-reasoning").unwrap();
+        assert_eq!(echo3, "claude-sonnet-4-5-20250929");
     }
 
     /// opus-4-5(老客户端)仍能规范化以防代号泄漏(审查 Architect#1 回归保护)。
@@ -162,6 +154,8 @@ mod tests {
     fn thinking_suffix_echo_is_case_insensitive() {
         let (_, echo) = requested_model_identity("claude-opus-4-8-THINKING").unwrap();
         assert_eq!(echo, "claude-opus-4-8", "大写 -THINKING 也应从回显剥除");
+        let (_, echo) = requested_model_identity("claude-opus-4-8-REASONING").unwrap();
+        assert_eq!(echo, "claude-opus-4-8", "大写 -REASONING 也应从回显剥除");
     }
 
     // === billing 指纹剥离(放宽判据后的回归保护) ===

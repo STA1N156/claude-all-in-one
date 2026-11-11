@@ -48,15 +48,17 @@ fn applied_row_is_visible_to_every_derived_lookup() {
     s.default_effort = Some("medium".into());
     assert_eq!(set_extra_models(&[s]), ApplyOutcome::Applied);
 
-    // 路由:plain / -thinking / 日期快照形态都不该 None。
+    // 路由:plain / 两种 Thinking 后缀 / 日期快照形态都不该 None。
     assert_eq!(map_model("claude-haiku-6").as_deref(), Some("claude-haiku-6"));
     assert_eq!(map_model("claude-haiku-6-thinking").as_deref(), Some("claude-haiku-6"));
+    assert_eq!(map_model("claude-haiku-6-reasoning").as_deref(), Some("claude-haiku-6"));
     // 身份短名缺省 = 展示名去掉 `Claude `。
     assert_eq!(resolve_base("claude-haiku-6").map(|m| m.identity_short), Some("Haiku 6"));
     // 公告目录。
     let ids: Vec<String> = advertised_models().into_iter().map(|m| m.id).collect();
     assert!(ids.contains(&"claude-haiku-6".to_string()));
     assert!(ids.contains(&"claude-haiku-6-thinking".to_string()));
+    assert!(ids.contains(&"claude-haiku-6-reasoning".to_string()));
     // 档位夹取:自己的档位表(没有 max → 夹到 high)。
     assert_eq!(clamp_effort_for_model("claude-haiku-6", None), Some("medium"));
     assert_eq!(clamp_effort_for_model("claude-haiku-6", Some("max")), Some("high"));
@@ -151,6 +153,7 @@ fn validation_rejects_each_bad_shape() {
         ("like 不存在", KiroExtraModelSpec { like: "claude-nope".into(), ..ok() }),
         ("大写", KiroExtraModelSpec { id: "Claude-X-9".into(), ..ok() }),
         ("-thinking 后缀", KiroExtraModelSpec { id: "claude-x-9-thinking".into(), ..ok() }),
+        ("-reasoning 后缀", KiroExtraModelSpec { id: "claude-x-9-reasoning".into(), ..ok() }),
         ("日期后缀", KiroExtraModelSpec { id: "claude-x-20261103".into(), ..ok() }),
         ("空 kiro_model", KiroExtraModelSpec { kiro_model: String::new(), ..ok() }),
         ("窗口为 0", KiroExtraModelSpec { context_window: Some(0), ..ok() }),

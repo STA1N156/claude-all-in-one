@@ -28,7 +28,7 @@
 //! - 零产出(没交付任何正文/工具调用/思考)不计缓存:用户没拿到东西不该为缓存付费。
 //! - cache_creation 恒 0(统一模型不单列缓存写入)。
 //! - cache_read 上报按 [`CacheStrategy`] 三选一(设置面板热切换):
-//!   - `sim`:模拟器命中比例 × 基准 × 倍率,按 floor/cap 夹限(见 [`crate::usage::reported_cache_read`])。
+//!   - `sim`:Kiro-Go 风格全局前缀指纹缓存;成功请求才写入,命中量最多到 cap。
 //!   - `credit_correct` / `credit_fit`:用 meteringEvent 的真实积分反推命中比例 h(见
 //!     [`infer_hit_ratio`]),前者只判冷热(h ≥ 0.5 → cap,否则 floor),后者按 h 夹限上报。
 //!     拿不到积分、模型无标定参数、输出过长、企业号时退回 `sim`(见 [`Decision`])。
@@ -44,8 +44,9 @@ use std::sync::Arc;
 
 use gw_core::config::{CacheStrategy, CreditModelSpec};
 
-use crate::cache_sim::SimResult;
-use crate::usage::{reported_cache_read, DEFAULT_CACHE_CAP_RATIO, DEFAULT_CACHE_FLOOR_RATIO, DEFAULT_CACHE_READ_MULTIPLIER};
+use crate::cache_sim::{PromptCacheProfile, SimResult};
+use crate::usage::{DEFAULT_CACHE_CAP_RATIO, DEFAULT_CACHE_FLOOR_RATIO, DEFAULT_CACHE_READ_MULTIPLIER};
+use crate::usage::reported_cache_read;
 
 /// 总输入低于此值不做积分反推:积分里的常数项和隐藏系统提示词占比太大,反推不稳。
 const CREDIT_MIN_INPUT_TOKENS: i32 = 1000;
@@ -219,8 +220,12 @@ pub struct OutputCounts {
 /// 计费所需的请求级上下文(chat_stream 组装,随流任务带到收尾)。
 #[derive(Debug, Clone)]
 pub struct BillingCtx {
-    /// 本轮 prefix 模拟器结果(observe 在发包前完成)。
+    /// 无后台缓存任务时的测试值 / 上游请求估算。
     pub sim: SimResult,
+    /// Kiro-Go 风格的后台前缀缓存任务;成功收尾时才计算并写回。
+    pub cache_profile: Option<Arc<PromptCacheProfile>>,
+    /// 生产路径由后台缓存统一管理;测试可固定 `sim` 走纯函数断言。
+    pub cache_managed: bool,
     /// 本请求开始时的计费参数快照(热调只影响之后的请求)。
     pub policy: CachePolicy,
     /// Kiro 上游模型 id(如 `claude-opus-5.5`),查积分参数表用。
@@ -299,7 +304,12 @@ pub fn finalize(
     produced_content: bool,
 ) -> BillingOutcome {
     let to_i32 = |n: i64| n.clamp(0, i32::MAX as i64) as i32;
-    let sim_total = ctx.sim.total_tokens.min(i32::MAX as u32) as i32;
+    let sim_total = ctx
+        .cache_profile
+        .as_ref()
+        .map(|profile| profile.total_tokens())
+        .unwrap_or(ctx.sim.total_tokens)
+        .min(i32::MAX as u32) as i32;
     let tokenized = to_i32(output.tokenized);
     // 积分反推的口径(与参数表标定口径一致),与是否修正上报无关。
     let credit_basis = CreditBasis {
@@ -312,7 +322,16 @@ pub fn finalize(
         (signals.legacy_input(sim_total), to_i32(output.legacy))
     };
     let (cache_read, decision) = if produced_content {
-        report_cache_read(signals, ctx, input_total, credit_basis)
+        let sim_read = if ctx.cache_managed {
+            ctx.cache_profile
+                .as_ref()
+                .map(|profile| profile.finish(input_total).cache_read_tokens)
+                .unwrap_or(0)
+                .min(input_total.max(0) as u32) as i32
+        } else {
+            sim_reported(input_total, &ctx.sim, &ctx.policy)
+        };
+        report_cache_read(signals, ctx, input_total, credit_basis, sim_read)
     } else {
         (0, Decision::ZeroOutput)
     };
@@ -338,9 +357,9 @@ fn report_cache_read(
     ctx: &BillingCtx,
     input_total: i32,
     basis: CreditBasis,
+    sim: i32,
 ) -> (i32, Decision) {
     let p = &ctx.policy;
-    let sim = sim_reported(input_total, &ctx.sim, p);
     let fit_only = match p.strategy.resolved() {
         CacheStrategy::Sim | CacheStrategy::Unknown => return (sim, Decision::Sim),
         CacheStrategy::CreditCorrect => false,
@@ -443,7 +462,6 @@ fn clamp_ratio(input_total: i32, ratio: f64, p: &CachePolicy) -> i32 {
     ((input_total.max(0) as f64 * r).round() as i32).clamp(0, input_total.max(0))
 }
 
-/// 模拟器口径的上报 cache_read。
 fn sim_reported(input_total: i32, sim: &SimResult, p: &CachePolicy) -> i32 {
     reported_cache_read(
         input_total,
@@ -465,6 +483,8 @@ mod tests {
                 cache_read_tokens: hit,
                 total_tokens: total,
             },
+            cache_profile: None,
+            cache_managed: false,
             policy: CachePolicy {
                 read_multiplier: 1.0,
                 cap_ratio: 0.95,

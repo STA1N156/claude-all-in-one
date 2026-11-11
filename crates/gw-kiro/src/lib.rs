@@ -273,7 +273,7 @@ impl Provider for KiroProvider {
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, UpstreamError> {
         // 目录由 converter 权威表 `KIRO_MODELS` **生成**(`advertised_models`):每个基础模型
-        // 展开 plain / -thinking / 日期快照 / 日期-thinking,与 chat 实际可服务(map_model)+
+        // 展开 plain / 两种 Thinking 后缀 / 日期快照变体,与 chat 实际可服务(map_model)+
         // 身份规范化(requested_model_identity)同源、不漂移。context_length 由
         // get_context_window_size 统一推导。真实 ListAvailableModels(逐账号上游查询)留 P2。
         let models = converter::advertised_models()
@@ -545,13 +545,16 @@ impl Provider for KiroProvider {
             },
         }
     
-        // cache_sim 全局 store 的 TTL / 容量(否则恒用编译期默认 300s / 4096)。
+        // Kiro-Go 风格的本地前缀缓存开关 / TTL / 每分片容量。
         // present 字段才覆盖(from_effective 总会带上)。
+        if let Some(v) = settings.get("cache_enabled").and_then(|v| v.as_bool()) {
+            cache_sim::set_enabled(v);
+        }
         if let Some(v) = settings.get("cache_sim_ttl_secs").and_then(|v| v.as_u64()) {
-            cache_sim::global().set_ttl_secs(v);
+            cache_sim::set_ttl_secs(v);
         }
         if let Some(v) = settings.get("cache_max_sessions").and_then(|v| v.as_u64()) {
-            cache_sim::global().set_max_sessions(v as usize);
+            cache_sim::set_max_sessions(v as usize);
         }
         match extra_models_error {
             Some(e) => Err(e),
@@ -618,7 +621,7 @@ fn is_default_available_model(model: &str) -> bool {
 
 /// 白名单匹配:对**请求名**和它归一后的**基础名**各试一次,任一命中即放行。
 ///
-/// 为什么要归一:调度器传进来的是客户端请求名(可能带 `-thinking` 后缀或日期快照),
+/// 为什么要归一:调度器传进来的是客户端请求名(可能带 Thinking 后缀或日期快照),
 /// 而运维在面板里写白名单时写的是基础名(`kimi-k3`)。只按请求名匹配的话,
 /// `["kimi-k3"]` 挡不住……准确说是挡住了 `kimi-k3-thinking`,而那本来就是同一个上游模型。
 /// 两种形态都试,既不用逼运维写 `kimi-k3*`,也不改 gw_core 那个共用匹配器的语义。
@@ -631,7 +634,7 @@ fn allowlist_allows(account: &Account, model: &str) -> bool {
     };
     // 三种写法都认,取第一个命中:
     //   请求名(上面已试)、对外基础名(`claude-opus-4-8`)、上游真名(`claude-opus-4.8`)。
-    // 对外基础名:调度器传进来的是客户端请求名(可能带 `-thinking`/日期),而运维写的是
+    // 对外基础名:调度器传进来的是客户端请求名(可能带 Thinking 后缀/日期),而运维写的是
     //   基础名,只按请求名匹配会把 `["kimi-k3"]` 和 `kimi-k3-thinking` 判成不匹配。
     // 上游真名:gw_core 的契约是「调用方传上游名」(cursor 就是这么做的),而运维很可能
     //   直接从「拉上游目录」的输出里照抄带点号的名字。不认它是 fail-closed —— 不会越权,

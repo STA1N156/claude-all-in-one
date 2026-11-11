@@ -128,8 +128,8 @@ fn check_id(id: &str) -> Result<(), String> {
         return Err(format!("id 只能用小写字母、数字、`.`、`-`,长度 1–{MAX_NAME_LEN}"));
     }
     // 这两种后缀由 resolve_base 统一剥掉,带着它们的 id 永远匹配不上。
-    if id.ends_with("-thinking") {
-        return Err("id 不能以 -thinking 结尾(thinking 变体自动派生)".into());
+    if id.ends_with("-thinking") || id.ends_with("-reasoning") {
+        return Err("id 不能以 -thinking 或 -reasoning 结尾(Thinking 变体自动派生)".into());
     }
     if id.rsplit('-').next().is_some_and(|t| t.len() == 8 && t.bytes().all(|b| b.is_ascii_digit())) {
         return Err("id 不能以 8 位日期结尾(日期段会被剥掉,永远匹配不上)".into());

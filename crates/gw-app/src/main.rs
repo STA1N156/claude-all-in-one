@@ -1,6 +1,6 @@
 //! claude-all-in-one 二进制入口。
 //!
-//! 单二进制多角色:`--mode router` / `--mode worker --instance N`;
+//! 单二进制多角色:`--mode all` / `--mode router` / `--mode worker --instance N`;
 //! 子机相关:`--mode hub`(主机上等子机来连)/ `--mode node`(子机)。
 //! 见 docs/ARCHITECTURE.md §1。
 
@@ -72,6 +72,8 @@ pub(crate) async fn shutdown_signal(role: &'static str) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Mode {
+    /// 单容器快速启动:同一进程内同时运行 router 和一个 worker。
+    All,
     /// 前置路由:鉴权 + session→worker 亲和 + 转发。
     Router,
     /// 实际反代:绑定固定出口 + 管理一组账号。
@@ -160,6 +162,21 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     match args.mode {
+        Mode::All => {
+            let instance = args.instance.unwrap_or(0);
+            tracing::info!(instance, "启动 all-in-one 快速部署模式");
+            tokio::try_join!(
+                router::run(&args.instances, &args.db, &args.system),
+                worker::run(
+                    instance,
+                    &args.instances,
+                    &args.accounts,
+                    &args.system,
+                    &args.db,
+                ),
+            )?;
+            Ok(())
+        }
         Mode::Router => {
             tracing::info!("启动 router 角色");
             router::run(&args.instances, &args.db, &args.system).await

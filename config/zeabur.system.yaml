@@ -1,0 +1,10 @@
+# 默认管理密码。部署时可用环境变量 ADMIN_TOKEN 覆盖。
+admin:
+  token: "123456"
+
+cache:
+  enabled: true
+  read_multiplier: 1.0
+  cap_ratio: 0.9
+  floor_ratio: 0.1
+  sim_ttl_secs: 300

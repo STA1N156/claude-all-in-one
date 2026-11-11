@@ -1,5 +1,6 @@
 # 运行开关(热调参数,沿用旧项目语义)。
 cache:
+  enabled: true
   read_multiplier: 1.0
   cap_ratio: 0.9
   floor_ratio: 0.1

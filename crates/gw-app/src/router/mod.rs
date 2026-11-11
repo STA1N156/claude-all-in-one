@@ -228,16 +228,27 @@ fn aggregate_display_workers(
 }
 
 pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> anyhow::Result<()> {
-    let instances: InstancesConfig = {
+    let mut instances: InstancesConfig = {
         let text = std::fs::read_to_string(instances_path)
             .map_err(|e| anyhow::anyhow!("读取 {} 失败: {e}", instances_path.display()))?;
         serde_yaml::from_str(&text)?
     };
     instances.validate()?; // 拓扑约束:同组多 worker 等违规直接拒绝启动。
+
+    // Zeabur 等平台通过 PORT 指定对外端口。只改 router 监听，worker 拓扑不变。
+    if let Ok(port) = std::env::var("PORT") {
+        let port = port.trim();
+        if !port.is_empty() {
+            let port: u16 = port
+                .parse()
+                .map_err(|_| anyhow::anyhow!("PORT 必须是 1-65535 的端口号: {port}"))?;
+            instances.router.listen = format!("0.0.0.0:{port}");
+        }
+    }
     // 与 worker 同口径:文件缺失 = 用默认值;存在却解析不了 = 拒绝启动。
     // 原先两个 `.ok()` 把「文件读不到」和「YAML 有语法/字段错」压成同一件事,后者静默回落默认值,
     // 于是 router 会带着一套跟 system.yaml 完全无关的配置跑起来(对抗审查 Skeptic#1)。
-    let system: SystemConfig = match std::fs::read_to_string(system_path) {
+    let mut system: SystemConfig = match std::fs::read_to_string(system_path) {
         Ok(text) => serde_yaml::from_str(&text).map_err(|e| {
             anyhow::anyhow!(
                 "{} 解析失败,拒绝以默认配置启动(默认值会静默重置超时/请求体上限等): {e}",
@@ -249,6 +260,12 @@ pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> a
             SystemConfig::default()
         }
     };
+    if let Ok(token) = std::env::var("ADMIN_TOKEN") {
+        let token = token.trim();
+        if !token.is_empty() {
+            system.admin.token = Some(token.to_string());
+        }
+    }
 
     // 数据面 worker 列表 = 跨所有 `instances*.yaml` 聚合(含各自 account_group),
     // 而非仅本 router 自己那批 —— 这样单一入口(38991)即可按 key 的分组派发到对应

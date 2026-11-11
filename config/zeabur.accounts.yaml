@@ -1,0 +1,5 @@
+# 首启先建好默认分组;账号登录后台后直接添加或导入。
+groups:
+  G0:
+    provider: kiro
+    accounts: []
